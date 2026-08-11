@@ -126,6 +126,7 @@ class AIClient:
                 "OPENAI_API_KEY=sk-..."
             )
         self.client = OpenAI(api_key=config.openai_api_key)
+        self.last_chart_descriptions: str = ""
 
     # ------------------------------------------------------------------
     @staticmethod
@@ -231,8 +232,19 @@ class AIClient:
             ("H1", snapshot.candles_h1),
         ):
             if candles:
-                lines.append(f"\nCandles {label} (Open/High/Low/Close/Time, most recent last):")
-                for c in candles:
+                # لیست عددی متنی کندل‌ها را به بازه‌ی اخیر محدود می‌کنیم -
+                # مستقل از تعداد کندلی که در تصویر چارت رسم شده. ساختار
+                # کلی و تاریخچه‌ی بلندمدت را مدل از روی خودِ تصویر می‌بیند
+                # (بند ۳.۲)؛ لیست متنی فقط برای دقت اعداد اخیر (تریگر، سطح
+                # دقیق) لازم است - فرستادن صدها خط عدد خام هم هزینه را
+                # بی‌دلیل بالا می‌برد و هم توجه مدل را از نکات مهم پرت می‌کند.
+                recent_candles = candles[-config.timeframes.max_text_candles:]
+                omitted = len(candles) - len(recent_candles)
+                header = f"\nCandles {label} (Open/High/Low/Close/Time, most recent last)"
+                if omitted > 0:
+                    header += f" - فقط {len(recent_candles)} کندل اخیر از {len(candles)} کل (بقیه فقط در تصویر چارت قابل مشاهده‌اند)"
+                lines.append(header + ":")
+                for c in recent_candles:
                     lines.append(
                         f"  {c.get('time')} O:{c.get('open')} H:{c.get('high')} "
                         f"L:{c.get('low')} C:{c.get('close')}"
@@ -268,8 +280,13 @@ class AIClient:
         نقطه ورود اصلی که analysis_service صدا می‌زند. داخلش دو مرحله انجام
         می‌شود: ابتدا توصیف خنثی هر تصویر (مرحله ۱)، سپس تصمیم‌گیری متنی
         نهایی بر اساس آن توصیف‌ها + قوانین کامل ANEWME (مرحله ۲).
+
+        شفافیت: متن کامل توصیف‌های مرحله ۱ روی self.last_chart_descriptions
+        ذخیره می‌شود تا analysis_service بتواند آن را در دیتابیس ذخیره کند
+        (برای دستور /inspect - دیدن کامل ورودی/خروجی هر تحلیل).
         """
         chart_descriptions = self.describe_all_charts(chart_paths, symbol)
+        self.last_chart_descriptions = chart_descriptions
 
         rules_text = load_anewme_rules()
 

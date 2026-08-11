@@ -65,6 +65,13 @@ def generate_clean_chart(
 
     title = f"{symbol}  |  {timeframe_label}  |  Last candle: {last_candle_time:%Y-%m-%d %H:%M UTC}"
 
+    # عرض تصویر متناسب با تعداد کندل - وگرنه با تعداد بالا (مثلاً ۲۰۰+)
+    # کندل‌ها آن‌قدر فشرده می‌شوند که هوش مصنوعی نمی‌تواند شکلشان را تشخیص
+    # دهد. سقف ۲۴ اینچ برای جلوگیری از رشد بی‌رویه هزینه پردازش تصویر
+    # (OpenAI بر اساس اندازه تصویر هم هزینه می‌گیرد) در نظر گرفته شده است.
+    candle_count = len(candles)
+    chart_width = min(24.0, max(10.0, candle_count * 0.045))
+
     plot_kwargs = dict(
         type="candle",
         style=style,
@@ -72,7 +79,7 @@ def generate_clean_chart(
         ylabel="Price",
         volume=False,           # طبق بند ۳ فقط کندل - حجم هم اندیکاتور اضافه محسوب می‌شود
         savefig=dict(fname=str(out_path), dpi=150, bbox_inches="tight"),
-        figsize=(10, 6),
+        figsize=(chart_width, 6),
         tight_layout=True,
     )
     if hlines is not None:      # فقط وقتی خط Watch قبلی واقعاً وجود دارد اضافه شود (بند ۳)

@@ -21,11 +21,14 @@ from storage.db import init_db
 from telegram_bot.handlers import (
     analyze_command,
     history_command,
+    inspect_command,
+    performance_command,
     start_command,
     status_command,
     unknown_command,
 )
 from watch.monitor_loop import WatchMonitor
+from watch.trade_tracker import TradeTracker
 
 logging.basicConfig(
     level=logging.INFO,
@@ -76,6 +79,8 @@ async def run() -> None:
     application.add_handler(CommandHandler("analyze", analyze_command))
     application.add_handler(CommandHandler("status", status_command))
     application.add_handler(CommandHandler("history", history_command))
+    application.add_handler(CommandHandler("performance", performance_command))
+    application.add_handler(CommandHandler("inspect", inspect_command))
     application.add_handler(MessageHandler(filters.COMMAND, unknown_command))
 
     async def notify(text: str) -> None:
@@ -86,6 +91,7 @@ async def run() -> None:
                 logger.exception("ارسال پیام به %s ناموفق بود", user_id)
 
     monitor = WatchMonitor(broker=broker, analysis_service=analysis_service, notify=notify)
+    tracker = TradeTracker(broker=broker)
 
     async with application:
         # معرفی دستورات به تلگرام تا با زدن "/" منوی خودکار همه دستورات را نشان دهد
@@ -94,14 +100,17 @@ async def run() -> None:
             BotCommand("analyze", "شروع تحلیل یک نماد - مثال: /analyze EURUSD"),
             BotCommand("status", "نمایش Watchهای فعال"),
             BotCommand("history", "نمایش سوابق تحلیل"),
+            BotCommand("performance", "آمار واقعی برد/باخت TRADEها"),
+            BotCommand("inspect", "دیدن کامل ورودی/خروجی آخرین تحلیل"),
         ])
         await application.start()
         await application.updater.start_polling()
         logger.info("ربات ANEWME اجرا شد.")
         try:
-            await monitor.start()
+            await asyncio.gather(monitor.start(), tracker.start())
         finally:
             monitor.stop()
+            tracker.stop()
             await application.updater.stop()
             await application.stop()
             broker.disconnect()

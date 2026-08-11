@@ -23,6 +23,16 @@ class MockBroker(BrokerBase):
         self.base_prices = base_prices or {
             "EURUSD": 1.1750, "GBPUSD": 1.3400, "USDJPY": 156.50, "DXY": 104.20,
         }
+        # برای تست دستی: می‌توانید مستقیم روی این دیکشنری‌ها مقدار بذارید
+        # تا رفتار «پوزیشن باز وجود دارد» شبیه‌سازی شود.
+        self._mock_open_positions: dict[str, list[dict]] = {}
+        self._mock_pending_orders: dict[str, list[dict]] = {}
+
+    def get_open_positions(self, symbol: str) -> list[dict]:
+        return self._mock_open_positions.get(symbol, [])
+
+    def get_pending_orders(self, symbol: str) -> list[dict]:
+        return self._mock_pending_orders.get(symbol, [])
 
     def connect(self) -> None:
         pass

@@ -46,3 +46,20 @@ class BrokerBase(ABC):
     @abstractmethod
     def is_market_open(self, symbol: str) -> bool:
         ...
+
+    @abstractmethod
+    def get_open_positions(self, symbol: str) -> list[dict]:
+        """
+        پوزیشن‌های باز واقعی روی این نماد - مستقیم از حساب MT5 خوانده
+        می‌شود، پس معاملات دستی از موبایل/دسکتاپ هم شناسایی می‌شوند.
+        هر رکورد حداقل باید شامل: {"ticket":..., "volume":..., "price_open":...}
+        """
+        ...
+
+    @abstractmethod
+    def get_pending_orders(self, symbol: str) -> list[dict]:
+        """
+        سفارش‌های Pending باز واقعی روی این نماد - مستقیم از حساب MT5.
+        هر رکورد حداقل باید شامل: {"ticket":..., "type":..., "price_open":...}
+        """
+        ...

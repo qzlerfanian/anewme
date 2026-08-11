@@ -75,6 +75,12 @@ class TimeframeConfig:
     m15_candle_count: int = field(default_factory=lambda: int(os.getenv("M15_CANDLE_COUNT", "20")))
     h1_candle_count: int = field(default_factory=lambda: int(os.getenv("H1_CANDLE_COUNT", "60")))
 
+    # سقف تعداد کندلی که در لیست متنی (نه تصویر) فرستاده می‌شود - مستقل
+    # از h1/m15/m5_candle_count بالا. حتی اگر تعداد کندل تصویر خیلی زیاد
+    # باشد، لیست متنی خام همیشه به همین مقدار محدود می‌ماند (کنترل هزینه
+    # و توجه مدل - نگاه کنید به core/ai_client.py::_format_market_snapshot)
+    max_text_candles: int = field(default_factory=lambda: int(os.getenv("MAX_TEXT_CANDLES", "30")))
+
 
 @dataclass
 class AppConfig:

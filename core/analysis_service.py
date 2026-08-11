@@ -27,7 +27,7 @@ from broker.base import BrokerBase
 from charts.chart_generator import generate_required_charts
 from config import config
 from core.ai_client import AIClient
-from core.models import AnalysisResult, AnalysisStatus, MarketSnapshot, WatchState
+from core.models import AnalysisResult, AnalysisStatus, Direction, Grade, MarketSnapshot, WatchState
 from core.parser import AIResponseParseError, parse_ai_response
 from core.risk_manager import calculate_position_size
 from core.consistency_checker import check_watch_consistency
@@ -70,9 +70,35 @@ class AnalysisService:
             db.log_event("MARKET_CLOSED", result.reason, symbol=symbol)
             return result
 
+        # --- مورد ۲: جلوگیری از ساخت Watch تکراری روی همین نماد ---
+        # تا زمانی که یک Watch فعال (هنوز بسته‌نشده) برای این نماد وجود
+        # دارد، تحلیل تازه‌ای که دوباره منجر به Watch شود اجرا نمی‌شود؛
+        # باید اول تکلیف Watch موجود (TRADE/NO_TRADE/انقضا/ابطال) روشن شود.
+        existing_watch = db.get_active_watch_for_symbol(symbol)
+        if existing_watch is not None:
+            logger.info("Watch فعال از قبل روی %s وجود دارد - تحلیل جدید رد شد.", symbol)
+            result = AnalysisResult(
+                analysis_time=datetime.now(timezone.utc),
+                symbol=symbol,
+                status=AnalysisStatus.WATCH,
+                direction=Direction(existing_watch["direction"]),
+                grade=Grade(existing_watch["grade"]),
+                reason=(
+                    f"یک Watch فعال از قبل روی {symbol} وجود دارد (سطح: "
+                    f"{existing_watch['zone_or_level']}، انقضا: {existing_watch['expiration']}). "
+                    "تا مشخص‌شدن تکلیف آن (TRADE/NO_TRADE/انقضا)، Watch جدیدی صادر نمی‌شود."
+                ),
+                timeframes_checked=[],
+            )
+            db.log_event("DUPLICATE_WATCH_PREVENTED", result.reason, symbol=symbol, watch_id=existing_watch["watch_id"])
+            return result
+
         chart_paths = self._build_charts(symbol, snapshot, needs_correlated_symbols)
         raw_text = self.ai_client.request_analysis(symbol, chart_paths, snapshot, previous_watch=None)
-        return self._finalize(symbol, raw_text, snapshot, chart_paths, parent_watch=None)
+        return self._finalize(
+            symbol, raw_text, snapshot, chart_paths, parent_watch=None,
+            chart_descriptions_text=self.ai_client.last_chart_descriptions,
+        )
 
     def run_watch_recheck(self, watch_row) -> AnalysisResult:
         """
@@ -110,7 +136,10 @@ class AnalysisService:
                                           only_timeframes=needed_tfs)
 
         raw_text = self.ai_client.request_analysis(symbol, chart_paths, snapshot, previous_watch=watch_state)
-        return self._finalize(symbol, raw_text, snapshot, chart_paths, parent_watch=watch_state)
+        return self._finalize(
+            symbol, raw_text, snapshot, chart_paths, parent_watch=watch_state,
+            chart_descriptions_text=self.ai_client.last_chart_descriptions,
+        )
 
     # ------------------------------------------------------------------
     def _build_charts(self, symbol: str, snapshot: MarketSnapshot, needs_correlated_symbols: bool,
@@ -148,6 +177,7 @@ class AnalysisService:
         snapshot: MarketSnapshot,
         chart_paths: list[Path],
         parent_watch: Optional[WatchState],
+        chart_descriptions_text: str = "",
     ) -> AnalysisResult:
         """
         پارس، اعتبارسنجی (بند ۱۷)، محاسبه حجم (بند ۱۸)، ذخیره‌سازی (بند ۲۰)
@@ -156,6 +186,12 @@ class AnalysisService:
         ایمن تبدیل می‌شود و دلیل دقیق ثبت/اعلام می‌شود.
         """
         analysis_id = str(uuid.uuid4())
+        parent_watch_id = parent_watch.watch_id if parent_watch else None
+
+        # مورد ۴: ساعت آخرین کندل M5 بسته‌شده - برای شفافیت خروجی
+        last_closed_m5_time = None
+        if snapshot.candles_m5:
+            last_closed_m5_time = snapshot.candles_m5[-1]["time"].strftime("%H:%M UTC")
 
         try:
             result = parse_ai_response(raw_text, expected_symbol=symbol)
@@ -172,6 +208,42 @@ class AnalysisService:
                 timeframes_checked=[],
                 raw_ai_text=raw_text,
             )
+        result.last_closed_m5_time = last_closed_m5_time
+
+        # --- مورد ۳: تشخیص پوزیشن باز/سفارش Pending واقعی روی این نماد ---
+        # این چک مستقیم از حساب MT5 خوانده می‌شود (نه از دیتابیس خودمان)
+        # تا معاملات دستی از موبایل/دسکتاپ هم شناسایی شوند. اگر پوزیشن یا
+        # سفارش باز پیدا شود، Grade/Reason همچنان (برای مانیتور) نمایش داده
+        # می‌شود ولی هیچ Watch/TRADE جدیدی ساخته یا ردیابی نمی‌شود - طبق
+        # قانون «تا وقتی روی نماد معامله فعال هست، سیگنال ورود جدید صادر نشود».
+        account_state = self._get_account_state(symbol)
+        if account_state is not None:
+            result.account_state = account_state
+            logger.info(
+                "پوزیشن/سفارش باز روی %s پیدا شد (%s) - سیگنال جدید صادر نمی‌شود.",
+                symbol, account_state,
+            )
+            db.save_analysis(
+                analysis_id=analysis_id,
+                symbol=symbol,
+                status=result.status.value,
+                direction=result.direction.value if result.direction else None,
+                grade=result.grade.value if result.grade else None,
+                reason=result.reason,
+                raw_ai_text=result.raw_ai_text,
+                chart_descriptions_text=chart_descriptions_text,
+                chart_paths=[str(p) for p in chart_paths],
+                market_snapshot_dict=_snapshot_to_dict(snapshot),
+                trade_details_dict=_dataclass_or_none(result.trade_details),
+                watch_details_dict=_dataclass_or_none(result.watch_details),
+                parent_watch_id=parent_watch_id,
+            )
+            db.log_event(
+                f"ACCOUNT_STATE_{account_state}",
+                f"{account_state} روی {symbol} فعال است - سیگنال جدید سرکوب شد.",
+                symbol=symbol,
+            )
+            return result
 
         if result.status == AnalysisStatus.TRADE:
             outcome = validate_trade_result(result, snapshot)
@@ -193,6 +265,21 @@ class AnalysisService:
                 if vol_result.warning:
                     result.reason += f" | هشدار حجم: {vol_result.warning}"
 
+                # ثبت ردیابی برای سنجش عملکرد واقعی بعداً (/performance) -
+                # این تنها راه سنجش عینی «آیا این استراتژی سودآور است؟» است
+                db.create_trade_tracking(
+                    analysis_id=analysis_id,
+                    symbol=symbol,
+                    direction=result.direction.value,
+                    order_type=result.trade_details.order_type.value,
+                    entry=result.trade_details.entry,
+                    stop_loss=result.trade_details.stop_loss,
+                    take_profit=result.trade_details.take_profit,
+                    risk_percent=result.trade_details.risk_percent,
+                    reward_risk_ratio=result.trade_details.reward_risk_ratio,
+                    expiration=result.trade_details.expiration,
+                )
+
         elif result.status == AnalysisStatus.WATCH:
             # بند ۱۵ فایل قوانین: چک برنامه‌نویسی‌شده تناقض (مکمل دستور به AI).
             # فقط لاگ می‌شود - نتیجه به کاربر تغییر نمی‌کند (طراحی محافظه‌کارانه
@@ -201,8 +288,6 @@ class AnalysisService:
             for warning_text in consistency_warnings:
                 logger.warning("تناقض احتمالی در WATCH %s: %s", symbol, warning_text)
                 db.log_event("WATCH_CONSISTENCY_WARNING", warning_text, symbol=symbol)
-
-        parent_watch_id = parent_watch.watch_id if parent_watch else None
 
         # --- بند ۲/۴/۵: تشخیص «بدون تغییر واقعی» قبل از هر تصمیمی درباره Watch ---
         # اگر این یک تحلیل مجدد است و نتیجه بازهم WATCH با همان مشخصات قبلی
@@ -226,6 +311,7 @@ class AnalysisService:
                 grade=result.grade.value if result.grade else None,
                 reason=result.reason,
                 raw_ai_text=result.raw_ai_text,
+                chart_descriptions_text=chart_descriptions_text,
                 chart_paths=[str(p) for p in chart_paths],
                 market_snapshot_dict=_snapshot_to_dict(snapshot),
                 trade_details_dict=None,
@@ -263,6 +349,7 @@ class AnalysisService:
             grade=result.grade.value if result.grade else None,
             reason=result.reason,
             raw_ai_text=result.raw_ai_text,
+            chart_descriptions_text=chart_descriptions_text,
             chart_paths=[str(p) for p in chart_paths],
             market_snapshot_dict=_snapshot_to_dict(snapshot),
             trade_details_dict=_dataclass_or_none(result.trade_details),
@@ -277,6 +364,23 @@ class AnalysisService:
             watch_id=new_watch_id or parent_watch_id,
         )
         return result
+
+    def _get_account_state(self, symbol: str) -> str | None:
+        """
+        بند جدید (مورد ۳): تشخیص پوزیشن باز یا سفارش Pending واقعی روی این
+        نماد، مستقیم از حساب MT5 - تا معاملات دستی موبایل/دسکتاپ هم دیده
+        شوند. اگر خطایی در ارتباط با بروکر رخ دهد، محافظه‌کارانه None
+        برگردانده می‌شود (یعنی تحلیل عادی ادامه پیدا می‌کند) تا یک خطای
+        موقت شبکه کل تحلیل را متوقف نکند.
+        """
+        try:
+            if self.broker.get_open_positions(symbol):
+                return "OPEN_POSITION"
+            if self.broker.get_pending_orders(symbol):
+                return "PENDING_ORDER"
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("بررسی پوزیشن/سفارش باز %s ناموفق بود: %s", symbol, exc)
+        return None
 
     @staticmethod
     def _row_to_watch_state(row) -> WatchState:

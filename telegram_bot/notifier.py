@@ -17,7 +17,38 @@ STATUS_EMOJI = {
 }
 
 
+ACCOUNT_STATE_EMOJI = {
+    "OPEN_POSITION": "🔒",
+    "PENDING_ORDER": "🕓",
+}
+ACCOUNT_STATE_LABEL = {
+    "OPEN_POSITION": "پوزیشن باز موجود (فقط مانیتور)",
+    "PENDING_ORDER": "سفارش Pending موجود (فقط مانیتور)",
+}
+
+
 def format_analysis_message(result: AnalysisResult) -> str:
+    # اگر پوزیشن/سفارش باز واقعی روی این نماد در MT5 پیدا شده، Status
+    # اصلی (TRADE/WATCH) دیگر معنی «سیگنال ورود جدید» ندارد - این حالت
+    # جداگانه و واضح نمایش داده می‌شود تا کاربر اشتباه نکند.
+    if result.account_state:
+        emoji = ACCOUNT_STATE_EMOJI.get(result.account_state, "ℹ️")
+        label = ACCOUNT_STATE_LABEL.get(result.account_state, result.account_state)
+        header = f"{emoji} {result.symbol} | {label}"
+        lines = [header, ""]
+        lines.append(f"🕒 Analysis Time: {result.analysis_time.strftime('%Y-%m-%d %H:%M UTC')}")
+        if result.last_closed_m5_time:
+            lines.append(f"🕔 Last Closed M5: {result.last_closed_m5_time}")
+        if result.grade:
+            lines.append(f"وضعیت تحلیلی فعلی بازار (فقط اطلاعاتی): Grade {result.grade.value}")
+        lines.append(f"📝 {result.reason}")
+        lines.append("")
+        lines.append(
+            "⚠️ چون روی این نماد از قبل معامله/سفارش فعال وجود دارد، ربات "
+            "سیگنال ورود جدیدی صادر نمی‌کند - فقط وضعیت بازار را مانیتور می‌کند."
+        )
+        return "\n".join(lines)
+
     emoji = STATUS_EMOJI.get(result.status, "ℹ️")
     header = f"{emoji} {result.symbol} | {result.status.value}"
     if result.grade:
@@ -25,6 +56,8 @@ def format_analysis_message(result: AnalysisResult) -> str:
 
     lines = [header, ""]
     lines.append(f"🕒 Analysis Time: {result.analysis_time.strftime('%Y-%m-%d %H:%M UTC')}")
+    if result.last_closed_m5_time:
+        lines.append(f"🕔 Last Closed M5: {result.last_closed_m5_time}")
     if result.direction:
         lines.append(f"↕️ Direction: {result.direction.value}")
     lines.append(f"📝 Reason: {result.reason}")

@@ -120,3 +120,38 @@ class MT5Broker(BrokerBase):
             symbol_lot_step=info.volume_step,
             symbol_pip_value=info.trade_tick_value * (10 if info.digits in (3, 5) else 1),
         )
+
+    def get_open_positions(self, symbol: str) -> list[dict]:
+        """
+        پوزیشن‌های باز واقعی - مستقیم از حساب MT5. مهم: این شامل معاملاتی
+        هم می‌شود که کاربر دستی از موبایل یا دسکتاپ MT5 باز کرده، نه فقط
+        معاملاتی که از طریق این ربات پیشنهاد شده‌اند.
+        """
+        positions = mt5.positions_get(symbol=symbol)
+        if not positions:
+            return []
+        return [
+            {
+                "ticket": p.ticket,
+                "volume": p.volume,
+                "price_open": p.price_open,
+                "type": "BUY" if p.type == mt5.ORDER_TYPE_BUY else "SELL",
+                "profit": p.profit,
+            }
+            for p in positions
+        ]
+
+    def get_pending_orders(self, symbol: str) -> list[dict]:
+        """سفارش‌های Pending باز واقعی - مستقیم از حساب MT5 (شامل ثبت دستی)."""
+        orders = mt5.orders_get(symbol=symbol)
+        if not orders:
+            return []
+        return [
+            {
+                "ticket": o.ticket,
+                "volume": o.volume_current,
+                "price_open": o.price_open,
+                "type": o.type,
+            }
+            for o in orders
+        ]

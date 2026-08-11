@@ -126,6 +126,12 @@ class AnalysisResult:
     # اما به تلگرام ارسال نمی‌شود - برای وقتی که تحلیل مجدد نشان می‌دهد
     # ستاپ واقعاً تغییری نکرده (رفع باگ ارسال مکرر Watch یکسان)
     suppress_notification: bool = False
+    # اگر پوزیشن باز یا سفارش Pending واقعی روی این نماد در MT5 پیدا شود،
+    # این فیلد به "OPEN_POSITION" یا "PENDING_ORDER" ست می‌شود و یعنی
+    # Status/Grade فقط جنبه‌ی مانیتور دارند، نه سیگنال ورود جدید.
+    account_state: Optional[str] = None
+    # ساعت آخرین کندل M5 بسته‌شده - برای شفافیت در پیام خروجی
+    last_closed_m5_time: Optional[str] = None
 
 
 @dataclass

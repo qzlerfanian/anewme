@@ -18,6 +18,7 @@ tests/test_rules_regression.py
 from __future__ import annotations
 
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -274,6 +275,133 @@ Invalidation: x
         )
     except Exception as exc:  # noqa: BLE001
         check("سناریو ۱۰: بازار بسته -> بدون تماس AI و NO_TRADE", False, f"استثنا: {exc}")
+
+    # ------------------------------------------------------------------
+    # سناریو ۱۱: جلوگیری از Watch تکراری روی همان نماد
+    from datetime import timedelta
+
+    init_db()
+    dup_broker = MockBroker(base_prices={"EURUSD": 1.1750})
+    dup_broker.is_market_open = lambda symbol: True
+    future_exp = (datetime.now(timezone.utc) + timedelta(hours=6)).isoformat()
+    fake_ai_dup = MagicMock()
+    fake_ai_dup.last_chart_descriptions = "توصیف نمونه"
+    fake_ai_dup.request_analysis.return_value = f"""Analysis Time: 2026-08-09T09:00:00Z
+Symbol: EURUSD
+Status: WATCH
+Direction: --
+Grade: A-
+Reason: تست
+Timeframes Checked: H1, M15
+Preferred Direction: BUY
+Trigger Type: بسته‌شدن کندل M5
+Zone Or Level: 1.1760
+Timeframes To Recheck: M5
+Expiration: {future_exp}
+Invalidation: x
+"""
+    svc_dup = AnalysisService(broker=dup_broker, ai_client=fake_ai_dup)
+    try:
+        r1 = svc_dup.run_initial_analysis("EURUSD", needs_correlated_symbols=False)
+        r2 = svc_dup.run_initial_analysis("EURUSD", needs_correlated_symbols=False)
+        ok = (
+            r1.status == AnalysisStatus.WATCH
+            and r2.status == AnalysisStatus.WATCH
+            and fake_ai_dup.request_analysis.call_count == 1  # بار دوم AI صدا زده نشده
+        )
+        check(
+            "سناریو ۱۱: جلوگیری از Watch تکراری روی همان نماد",
+            ok,
+            f"ai_call_count={fake_ai_dup.request_analysis.call_count}",
+        )
+    except Exception as exc:  # noqa: BLE001
+        check("سناریو ۱۱: جلوگیری از Watch تکراری روی همان نماد", False, f"استثنا: {exc}")
+
+    # ------------------------------------------------------------------
+    # سناریو ۱۲: پوزیشن باز واقعی در MT5 -> سیگنال جدید سرکوب شود
+    init_db()
+    pos_broker = MockBroker(base_prices={"GBPUSD": 1.3400})
+    pos_broker.is_market_open = lambda symbol: True
+    pos_broker._mock_open_positions["GBPUSD"] = [
+        {"ticket": 1, "volume": 0.1, "price_open": 1.3395, "type": "BUY", "profit": 5.0}
+    ]
+    fake_ai_pos = MagicMock()
+    fake_ai_pos.last_chart_descriptions = "توصیف نمونه"
+    fake_ai_pos.request_analysis.return_value = f"""Analysis Time: 2026-08-09T09:00:00Z
+Symbol: GBPUSD
+Status: TRADE
+Direction: BUY
+Grade: A+
+Reason: تست
+Timeframes Checked: H1, M15, M5
+Order Type: BUY_LIMIT
+Entry: 1.3399
+Stop Loss: 1.3389
+Take Profit: 1.3419
+Risk Percent: 1.0
+Reward Risk Ratio: 2.0
+Expiration: {future_exp}
+Invalidation: x
+Checklist Complete: true
+"""
+    svc_pos = AnalysisService(broker=pos_broker, ai_client=fake_ai_pos)
+    try:
+        r = svc_pos.run_initial_analysis("GBPUSD", needs_correlated_symbols=False)
+        from storage.db import get_open_trade_trackings as _get_open
+        ok = r.account_state == "OPEN_POSITION" and len(_get_open()) == 0
+        check("سناریو ۱۲: پوزیشن باز MT5 -> سیگنال جدید سرکوب و ردیابی نشود", ok, f"account_state={r.account_state}")
+    except Exception as exc:  # noqa: BLE001
+        check("سناریو ۱۲: پوزیشن باز MT5 -> سیگنال جدید سرکوب و ردیابی نشود", False, f"استثنا: {exc}")
+
+    # ------------------------------------------------------------------
+    # سناریو ۱۳: last_closed_m5_time در نتیجه پر شود
+    m5_broker = MockBroker(base_prices={"USDCHF": 0.8800})
+    m5_broker.is_market_open = lambda symbol: True
+    fake_ai_m5 = MagicMock()
+    fake_ai_m5.last_chart_descriptions = "توصیف نمونه"
+    fake_ai_m5.request_analysis.return_value = """Analysis Time: 2026-08-09T09:00:00Z
+Symbol: USDCHF
+Status: NO_TRADE
+Direction: --
+Grade: C
+Reason: تست
+Timeframes Checked: M5
+"""
+    svc_m5 = AnalysisService(broker=m5_broker, ai_client=fake_ai_m5)
+    try:
+        r = svc_m5.run_initial_analysis("USDCHF", needs_correlated_symbols=False)
+        ok = r.last_closed_m5_time is not None and "UTC" in r.last_closed_m5_time
+        check("سناریو ۱۳: last_closed_m5_time در نتیجه پر می‌شود", ok, f"last_closed_m5_time={r.last_closed_m5_time}")
+    except Exception as exc:  # noqa: BLE001
+        check("سناریو ۱۳: last_closed_m5_time در نتیجه پر می‌شود", False, f"استثنا: {exc}")
+
+    # ------------------------------------------------------------------
+    # سناریو ۱۴: Trigger Type بدون کلیدواژه شناخته‌شده (مثل "M5 Close > 1.1560")
+    # نباید بی‌صدا نادیده گرفته شود - این دقیقاً باگ گزارش‌شده توسط کارفرما بود
+    from watch.watch_manager import check_trigger as _check_trigger
+
+    init_db()
+    weird_row = {
+        "watch_id": "regression-weird", "symbol": "EURUSD", "direction": "BUY",
+        "trigger_type": "M5 Close > 1.1560", "zone_or_level": "1.1560",
+        "expiration": "2099-01-01T00:00:00+00:00",
+        "is_locked": 0, "is_triggered": 0, "is_closed": 0,
+        "last_checked_candle_time": None,
+    }
+    weird_broker = MagicMock()
+    weird_broker.get_candles.return_value = [{
+        "time": datetime(2026, 8, 11, 10, 0, tzinfo=timezone.utc),
+        "open": 1.1550, "high": 1.1570, "low": 1.1548, "close": 1.1565,
+    }]
+    try:
+        triggered, reason = _check_trigger(weird_row, weird_broker)
+        ok = triggered is True
+        check(
+            "سناریو ۱۴: Trigger Type غیراستاندارد نباید بی‌صدا نادیده گرفته شود",
+            ok, f"triggered={triggered}, reason={reason}",
+        )
+    except Exception as exc:  # noqa: BLE001
+        check("سناریو ۱۴: Trigger Type غیراستاندارد نباید بی‌صدا نادیده گرفته شود", False, f"استثنا: {exc}")
 
 
 def main() -> int:

@@ -119,45 +119,64 @@ def check_trigger(watch_row, broker: BrokerBase) -> tuple[bool, str]:
     # این کندل جدید است؛ صرف‌نظر از نتیجه، ثبت می‌شود که بررسی شد
     db.update_watch_last_checked_candle(watch_row["watch_id"], latest_candle_time)
 
-    bid, ask = broker.get_current_price(symbol)
-    mid_price = (bid + ask) / 2
+    latest_candle = latest_m5[-1]
+    candle_high = latest_candle["high"]
+    candle_low = latest_candle["low"]
+    candle_close = latest_candle["close"]
     trigger_type = watch_row["trigger_type"]
+    trigger_type_lower = trigger_type.lower()
     zone_text = watch_row["zone_or_level"]
+    direction = watch_row["direction"]
 
     # تلاش برای استخراج عدد از zone_or_level (سطح تکی یا محدوده "1.1700-1.1750")
     levels = _extract_levels(zone_text)
     if not levels:
         return False, ""
 
-    if "زون" in trigger_type or "محدوده" in trigger_type or len(levels) == 2:
-        low, high = min(levels), max(levels)
-        if low <= mid_price <= high:
+    # --- ۱) زون/محدوده (دو سطح) ---
+    is_zone = "زون" in trigger_type or "محدوده" in trigger_type or "range" in trigger_type_lower or len(levels) == 2
+    if is_zone and len(levels) >= 2:
+        low, high = min(levels[:2]), max(levels[:2])
+        # بازه High/Low کل کندل چک می‌شود، نه فقط قیمت لحظه‌ای - وگرنه اگر
+        # قیمت وسط کندل به زون برخورد کند و قبل از پایان کندل برگردد، آن
+        # برخورد کاملاً از دست می‌رود.
+        if not (candle_high < low or candle_low > high):  # همپوشانی بازه‌ها
             return True, f"PRICE_ENTERED_ZONE({low}-{high})"
         return False, ""
 
     level = levels[0]
-    if "سطح" in trigger_type or "level" in trigger_type.lower():
-        direction = watch_row["direction"]
-        if direction == Direction.BUY.value and mid_price >= level:
-            return True, f"PRICE_REACHED_LEVEL({level})"
-        if direction == Direction.SELL.value and mid_price <= level:
-            return True, f"PRICE_REACHED_LEVEL({level})"
-        return False, ""
 
-    if "کندل" in trigger_type or "candle" in trigger_type.lower():
-        tf = "M5" if "M5" in trigger_type else "M15"
-        candles = broker.get_candles(symbol, tf, 2)
-        if not candles:
-            return False, ""
-        last_closed = candles[-2] if len(candles) >= 2 else candles[-1]
-        close_price = last_closed["close"]
-        direction = watch_row["direction"]
+    # --- ۲) صراحتاً «بسته‌شدن کندل» (باید دقیقاً close چک شود، نه لمس) ---
+    is_candle_close = (
+        "کندل" in trigger_type or "candle" in trigger_type_lower or
+        "بسته" in trigger_type or "close" in trigger_type_lower
+    )
+    if is_candle_close:
+        tf = "M15" if "M15" in trigger_type else "M5"
+        if tf == "M5":
+            close_price = candle_close  # همان کندلی که برای گیت هم استفاده شد
+        else:
+            candles = broker.get_candles(symbol, tf, 1)
+            if not candles:
+                return False, ""
+            close_price = candles[-1]["close"]
         if direction == Direction.BUY.value and close_price >= level:
             return True, f"CANDLE_{tf}_CLOSED_ABOVE({level})"
         if direction == Direction.SELL.value and close_price <= level:
             return True, f"CANDLE_{tf}_CLOSED_BELOW({level})"
         return False, ""
 
+    # --- ۳) fallback ایمن برای هر عبارت دیگری (مثلاً انگلیسی بدون کلیدواژه
+    # شناخته‌شده مثل "M5 Close > 1.1560") ---
+    # نکته حیاتی (رفع باگ گزارش‌شده): این تابع قبلاً اگر متن Trigger Type
+    # هیچ‌کدام از کلیدواژه‌های بالا را نداشت، بی‌صدا False برمی‌گرداند و
+    # آن Watch برای همیشه هرگز trigger نمی‌شد - حتی اگر قیمت کاملاً از
+    # سطح رد شده بود. حالا به‌جای شکست خاموش، رفتار پیش‌فرض «لمس سطح»
+    # (بر اساس High/Low کندل) اعمال می‌شود که امن‌ترین حالت ممکن است.
+    if direction == Direction.BUY.value and candle_high >= level:
+        return True, f"PRICE_REACHED_LEVEL_FALLBACK({level})"
+    if direction == Direction.SELL.value and candle_low <= level:
+        return True, f"PRICE_REACHED_LEVEL_FALLBACK({level})"
     return False, ""
 
 

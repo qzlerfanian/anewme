@@ -1,0 +1,29 @@
+# --- محرمانه - هرگز نباید commit شوند ---
+.env
+*.env
+!.env.example
+
+# --- محیط پایتون ---
+venv/
+.venv/
+env/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+
+# --- داده‌های اجرایی محلی (دیتابیس، لاگ، چارت‌های موقت) ---
+data/anewme.db
+data/anewme.db-journal
+data/charts_tmp/*.png
+logs/*.log
+
+# --- IDE ---
+.idea/
+.vscode/
+*.swp
+
+# --- سیستم‌عامل ---
+.DS_Store
+Thumbs.db
