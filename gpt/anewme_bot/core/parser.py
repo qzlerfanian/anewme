@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import re
 import math
+from core.clock import utc_now
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -52,7 +53,11 @@ def _extract_field(text: str, field_name: str, required: bool = True) -> Optiona
     match = re.search(pattern, text, flags=re.MULTILINE)
     if match:
         value = match.group(1).strip()
-        return None if value in ("--", "-", "") else value
+        if value in ('--', '-', ''):
+            if required:
+                raise AIResponseParseError(f"فیلد الزامی '{field_name}' خالی است.")
+            return None
+        return value
     if required:
         raise AIResponseParseError(f"فیلد الزامی '{field_name}' در پاسخ AI یافت نشد.")
     return None
@@ -113,6 +118,7 @@ def parse_ai_response(raw_text: str, expected_symbol: str) -> AnalysisResult:
         raise AIResponseParseError(f"Analysis Time معتبر نیست: {analysis_time_raw}") from exc
     if analysis_time.tzinfo is None:
         analysis_time = analysis_time.replace(tzinfo=timezone.utc)
+    analysis_time = utc_now()  # execution time is never supplied by the model
 
     direction_raw = _extract_field(raw_text, "Direction", required=False)
     direction = Direction(direction_raw) if direction_raw in Direction._value2member_map_ else None
@@ -197,6 +203,11 @@ def parse_ai_response(raw_text: str, expected_symbol: str) -> AnalysisResult:
             expiration=_extract_field(raw_text, "Expiration"),
             invalidation=invalidation,
         )
+        from watch.conditions import parse_conditions
+        try:
+            parse_conditions(pref_dir_raw, trigger_type, zone, invalidation)
+        except ValueError as exc:
+            raise AIResponseParseError(str(exc)) from exc
 
     return AnalysisResult(
         analysis_time=analysis_time,

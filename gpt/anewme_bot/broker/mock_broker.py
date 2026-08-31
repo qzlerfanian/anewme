@@ -14,11 +14,15 @@ import random
 from datetime import datetime, timedelta, timezone
 
 from broker.base import BrokerBase
+from broker.candle_utils import normalize_candle
 from config import config
 from core.models import MarketSnapshot
 
 
 class MockBroker(BrokerBase):
+    def get_account_open_risk_amount(self):
+        return 0.0
+
     def __init__(self, base_prices: dict[str, float] | None = None):
         self.base_prices = base_prices or {
             "EURUSD": 1.1750, "GBPUSD": 1.3400, "USDJPY": 156.50, "DXY": 104.20,
@@ -42,18 +46,21 @@ class MockBroker(BrokerBase):
 
     def _gen_candles(self, symbol: str, count: int, step_minutes: int) -> list[dict]:
         price = self.base_prices.get(symbol, 1.0)
-        now = datetime.now(timezone.utc)
+        now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+        # هر سری روی مرز واقعی همان تایم‌فریم ساخته می‌شود.
+        minute = (now.minute // step_minutes) * step_minutes if step_minutes < 60 else 0
+        current_open = now.replace(minute=minute)
         candles = []
         for i in range(count, 0, -1):
             o = price + random.uniform(-0.002, 0.002)
             c = o + random.uniform(-0.001, 0.001)
             h = max(o, c) + random.uniform(0, 0.0008)
             l = min(o, c) - random.uniform(0, 0.0008)
-            candles.append({
-                "time": now - timedelta(minutes=step_minutes * i),
+            candles.append(normalize_candle({
+                "time": current_open - timedelta(minutes=step_minutes * i),
                 "open": round(o, 5), "high": round(h, 5),
                 "low": round(l, 5), "close": round(c, 5),
-            })
+            }, timeframe={5: "M5", 15: "M15", 60: "H1"}[step_minutes]))
             price = c
         return candles
 

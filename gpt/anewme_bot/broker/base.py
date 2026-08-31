@@ -20,6 +20,9 @@ from core.models import MarketSnapshot
 
 class BrokerBase(ABC):
 
+    def get_account_open_risk_amount(self):
+        raise RuntimeError('بروکر کنترل ریسک باز کل حساب را پیاده‌سازی نکرده است.')
+
     @abstractmethod
     def connect(self) -> None:
         ...

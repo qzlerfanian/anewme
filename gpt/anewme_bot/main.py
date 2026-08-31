@@ -32,14 +32,11 @@ from telegram_bot.handlers import (
 from watch.monitor_loop import WatchMonitor
 from watch.trade_tracker import TradeTracker
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[
-        logging.FileHandler(LOG_DIR / "anewme_bot.log", encoding="utf-8"),
-        logging.StreamHandler(),
-    ],
-)
+from core.runtime import configure_logging, ProcessLock
+from core.worker import AnalysisWorker
+from telegram_bot.delivery import DeliveryWorker
+from storage import work_queue
+configure_logging()
 logger = logging.getLogger(__name__)
 
 
@@ -66,7 +63,6 @@ def build_broker():
 
 
 async def run() -> None:
-    init_db()
 
     if not config.telegram_token:
         raise RuntimeError("TELEGRAM_BOT_TOKEN تنظیم نشده است.")
@@ -77,12 +73,27 @@ async def run() -> None:
         )
 
     broker = build_broker()
-    broker.connect()
+    try:
+        broker.connect()
+        init_db()  # migrations/expiry use the synchronized broker UTC clock
+        await run_connected(broker)
+    finally:
+        broker.disconnect()
 
+
+async def run_connected(broker) -> None:
     ai_client = AIClient()
     analysis_service = AnalysisService(broker=broker, ai_client=ai_client)
 
-    application = Application.builder().token(config.telegram_token).build()
+    builder = Application.builder().token(config.telegram_token)
+    import os
+    proxy = os.getenv("TELEGRAM_PROXY_URL")
+    if proxy:
+        builder = builder.proxy(proxy).get_updates_proxy(proxy)
+    application = builder.build()
+    async def on_error(update, context):
+        logger.error("Telegram handler failed: %s", context.error)
+    application.add_error_handler(on_error)
     application.bot_data["analysis_service"] = analysis_service
 
     application.add_handler(CommandHandler("start", start_command))
@@ -95,14 +106,10 @@ async def run() -> None:
     application.add_handler(CommandHandler("inspect", inspect_command))
     application.add_handler(MessageHandler(filters.COMMAND, unknown_command))
 
-    async def notify(text: str) -> None:
-        for user_id in config.telegram_allowed_user_ids:
-            try:
-                await application.bot.send_message(chat_id=user_id, text=text)
-            except Exception:
-                logger.exception("ارسال پیام به %s ناموفق بود", user_id)
-
-    monitor = WatchMonitor(broker=broker, analysis_service=analysis_service, notify=notify)
+    monitor = WatchMonitor(broker=broker, analysis_service=analysis_service)
+    worker = AnalysisWorker(analysis_service)
+    delivery = DeliveryWorker(application.bot)
+    worker.recover()
     tracker = TradeTracker(broker=broker)
 
     async with application:
@@ -113,21 +120,34 @@ async def run() -> None:
             BotCommand("symbols", "انتخاب سریع نماد برای تحلیل"),
             BotCommand("status", "نمایش Watchهای فعال"),
             BotCommand("history", "نمایش سوابق تحلیل"),
-            BotCommand("performance", "آمار واقعی برد/باخت TRADEها"),
+            BotCommand("performance", "آمار تخمینی پیگیری سیگنال‌ها"),
             BotCommand("inspect", "دیدن کامل ورودی/خروجی آخرین تحلیل"),
         ])
-        await application.start()
-        await application.updater.start_polling()
-        logger.info("ربات ANEWME اجرا شد.")
+        tasks = []
         try:
-            await asyncio.gather(monitor.start(), tracker.start())
+            await application.start()
+            await application.updater.start_polling()
+            logger.info("ربات ANEWME اجرا شد.")
+            tasks = [asyncio.create_task(loop.start()) for loop in (monitor, tracker, worker, delivery)]
+            await asyncio.gather(*tasks)
         finally:
             monitor.stop()
             tracker.stop()
-            await application.updater.stop()
-            await application.stop()
-            broker.disconnect()
+            worker.stop()
+            delivery.stop()
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            if application.updater.running:
+                await application.updater.stop()
+            if application.running:
+                await application.stop()
 
 
 if __name__ == "__main__":
-    asyncio.run(run())
+    try:
+        with ProcessLock():
+            asyncio.run(run())
+    except KeyboardInterrupt:
+        logger.info("ربات متوقف شد.")

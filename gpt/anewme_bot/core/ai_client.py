@@ -30,10 +30,13 @@ from __future__ import annotations
 import base64
 import logging
 import time
+import hashlib
+import threading
+import json
 from pathlib import Path
 from typing import Optional
 
-from openai import OpenAI
+from openai import OpenAI, APIConnectionError, APITimeoutError, APIStatusError
 
 from config import config
 from core.models import MarketSnapshot, WatchState
@@ -80,7 +83,7 @@ Symbol: <SYMBOL>
 Status: <TRADE|WATCH|NO_TRADE>
 Direction: (فقط یکی از این دو کلمه: BUY یا SELL - اگر غیرقابل‌اعمال است دقیقاً بنویسید دو خط تیره: --)
 Grade: <A+|A|A-|B+|B|C>
-Reason: <متن کوتاه>
+Reason: <دلیل دقیق و قابل‌اندازه‌گیری؛ عبارت کلی «شرایط ورود نهایی محقق نشد» ممنوع است. عامل رد مانند ضعف M5، RR، فاصله ورود، SL یا افت Grade را مشخص کنید>
 Timeframes Checked: <لیست با کاما>
 
 اگر Status=TRADE، این فیلدهای اضافه را هم بنویسید:
@@ -97,7 +100,7 @@ Checklist Complete: <true|false>
 اگر Status=WATCH، این فیلدهای اضافه را هم بنویسید:
 Preferred Direction: <BUY|SELL>
 Trigger Type: <یکی از: زون ورود/خروج، سطح مشخص، بسته‌شدن کندل M5،
-              بسته‌شدن کندل M15، زمان مشخص، شرط ابطال، زمان انقضا>
+              بسته‌شدن کندل M15>
 Zone Or Level: <محدوده یا سطح دقیق - عدد، نه توصیف مبهم>
 Timeframes To Recheck: <لیست>
 Expiration: <زمان>
@@ -114,7 +117,7 @@ Invalidation: <شرط عددی/زمانی/وابسته به کندل - نه عب
 class AIClient:
     REFUSAL_MARKERS = ("i'm sorry", "i cannot assist", "i can't assist", "i am unable to",
                         "i'm unable to", "i can not assist")
-    MAX_ATTEMPTS = 3  # طبق مشاهده عملی: رد شدن مدل روی این نوع درخواست تصادفی است، نه قطعی
+    MAX_ATTEMPTS = 3  # Only transient transport/server errors are retried.
 
     def __init__(self):
         if not config.openai_api_key:
@@ -125,8 +128,17 @@ class AIClient:
                 "محتوای مورد انتظار باید خطی شبیه این داشته باشد (بدون فاصله اضافه، بدون کوتیشن):\n"
                 "OPENAI_API_KEY=sk-..."
             )
-        self.client = OpenAI(api_key=config.openai_api_key)
+        self.client = OpenAI(api_key=config.openai_api_key, max_retries=0, timeout=45)
+        self._request_local = threading.local()
         self.last_chart_descriptions: str = ""
+
+    @property
+    def last_chart_descriptions(self):
+        return getattr(self._request_local, 'descriptions', '')
+
+    @last_chart_descriptions.setter
+    def last_chart_descriptions(self, value):
+        self._request_local.descriptions = value
 
     # ------------------------------------------------------------------
     @staticmethod
@@ -141,12 +153,7 @@ class AIClient:
         )
 
     def _call_with_retry(self, messages: list, max_tokens: int, label: str) -> str:
-        """
-        فراخوانی عمومی مدل با retry خودکار در صورت رد شدن (رفتار stochastic
-        که در عمل مشاهده شد). label فقط برای لاگ خواناتر است.
-        """
-        last_raw_text = ""
-        last_error: Exception | None = None
+        """Retry transient failures only; never retry refusals or exhausted quota."""
         for attempt in range(1, self.MAX_ATTEMPTS + 1):
             logger.info("درخواست '%s' به OpenAI (تلاش %d/%d)", label, attempt, self.MAX_ATTEMPTS)
             try:
@@ -157,7 +164,13 @@ class AIClient:
                     messages=messages,
                 )
             except Exception as exc:  # خطاهای موقت شبکه/API نیز retry می‌شوند
-                last_error = exc
+                code = getattr(exc, 'code', None)
+                status = getattr(exc, 'status_code', None)
+                permanent = code in ('insufficient_quota', 'credit_balance_exhausted',
+                                     'organization_spend_limit_exceeded', 'project_spend_limit_exceeded')
+                transient = isinstance(exc, (APIConnectionError, APITimeoutError)) or status in (408, 429, 500, 502, 503, 504)
+                if permanent or not transient:
+                    raise RuntimeError(f'خطای غیرقابل تکرار API ({code or status or type(exc).__name__})؛ تنظیمات یا اعتبار را بررسی کنید.') from exc
                 logger.warning("درخواست '%s' در تلاش %d خطا داد: %s", label, attempt, exc)
                 if attempt < self.MAX_ATTEMPTS:
                     time.sleep(1.5 * attempt)
@@ -167,21 +180,14 @@ class AIClient:
             finish_reason = response.choices[0].finish_reason
             logger.debug("'%s' تلاش %d | finish_reason=%s | پاسخ:\n%s", label, attempt, finish_reason, raw_text)
 
+            if finish_reason == 'length':
+                raise RuntimeError('پاسخ AI ناقص است؛ به حد خروجی رسیده است.')
             if not self._looks_like_refusal(raw_text, finish_reason):
                 return raw_text
 
-            last_raw_text = raw_text
-            logger.warning(
-                "درخواست '%s' رد شد (تلاش %d/%d, finish_reason=%s). متن: %s",
-                label, attempt, self.MAX_ATTEMPTS, finish_reason, raw_text,
-            )
-            if attempt < self.MAX_ATTEMPTS:
-                time.sleep(1.5)
+            raise RuntimeError('مدل از پاسخ‌دادن خودداری کرد؛ تحلیل متوقف شد.')
 
-        logger.error("درخواست '%s' بعد از %d تلاش همچنان رد شد.", label, self.MAX_ATTEMPTS)
-        if not last_raw_text and last_error:
-            raise RuntimeError(f"پاسخ معتبری برای {label} دریافت نشد") from last_error
-        return last_raw_text
+        raise RuntimeError(f"پاسخ معتبری برای {label} دریافت نشد")
 
     # ------------------------------------------------------------------ مرحله ۱
     def describe_chart_image(self, image_path: Path, symbol: str, timeframe_label: str) -> str:
@@ -206,11 +212,16 @@ class AIClient:
         از این‌رو نماد و تایم‌فریم از روی اسم فایل استخراج می‌شود.
         """
         blocks = []
+        from storage.work_queue import cache_get, cache_put
         for path in chart_paths:
-            parts = path.stem.split("_")
+            parts = path.stem.rsplit("_", 2)
             chart_symbol = parts[0] if len(parts) > 0 else symbol
             chart_tf = parts[1] if len(parts) > 1 else "?"
-            description = self.describe_chart_image(path, chart_symbol, chart_tf)
+            key = hashlib.sha256(path.read_bytes() + (config.ai_model + IMAGE_DESCRIPTION_PROMPT).encode()).hexdigest()
+            description = cache_get(key)
+            if description is None:
+                description = self.describe_chart_image(path, chart_symbol, chart_tf)
+                cache_put(key, description)
             blocks.append(f"--- توصیف چارت {chart_symbol} / {chart_tf} ---\n{description}")
         return "\n\n".join(blocks)
 
@@ -251,14 +262,14 @@ class AIClient:
                 # بی‌دلیل بالا می‌برد و هم توجه مدل را از نکات مهم پرت می‌کند.
                 recent_candles = candles[-config.timeframes.max_text_candles:]
                 omitted = len(candles) - len(recent_candles)
-                header = f"\nCandles {label} (Open/High/Low/Close/Time, most recent last)"
+                header = f"\nCandles {label} (OHLC/Open-Time/Close-Time UTC, most recent last)"
                 if omitted > 0:
                     header += f" - فقط {len(recent_candles)} کندل اخیر از {len(candles)} کل (بقیه فقط در تصویر چارت قابل مشاهده‌اند)"
                 lines.append(header + ":")
                 for c in recent_candles:
                     lines.append(
-                        f"  {c.get('time')} O:{c.get('open')} H:{c.get('high')} "
-                        f"L:{c.get('low')} C:{c.get('close')}"
+                        f"  open={c.get('open_time', c.get('time'))} close={c.get('close_time')} "
+                        f"O:{c.get('open')} H:{c.get('high')} L:{c.get('low')} C:{c.get('close')}"
                     )
         return "\n".join(lines)
 
@@ -277,6 +288,13 @@ class AIClient:
             f"Timeframes To Recheck: {', '.join(watch.timeframes_to_recheck)}\n"
             f"Expiration: {watch.expiration.isoformat()}\n"
             f"Invalidation: {watch.invalidation_condition}\n"
+            f"Lifecycle Status: {watch.close_status or 'ACTIVE'}\n"
+            f"Triggered At (UTC): {watch.triggered_at.isoformat() if watch.triggered_at else '--'}\n"
+            f"Trigger Evidence: {watch.close_reason or '--'}\n"
+            "IMPORTANT: This WATCH trigger has already happened on a fully closed candle. "
+            "Do not say that the old trigger is still missing, do not request the same trigger again, "
+            "and do not return WATCH for the same scenario. Perform the final entry confirmation now: "
+            "return TRADE only if all final entry rules are satisfied; otherwise return NO_TRADE.\n"
         )
 
     # ------------------------------------------------------------------ مرحله ۲
@@ -286,6 +304,7 @@ class AIClient:
         chart_paths: list[Path],
         snapshot: MarketSnapshot,
         previous_watch: Optional[WatchState] = None,
+        previous_analysis_text: str = "",
     ) -> str:
         """
         نقطه ورود اصلی که analysis_service صدا می‌زند. داخلش دو مرحله انجام
@@ -308,6 +327,13 @@ class AIClient:
         ]
         if previous_watch is not None:
             text_blocks.append(self._format_previous_watch(previous_watch))
+            if previous_analysis_text:
+                text_blocks.append(
+                    "\n--- INITIAL ANALYSIS OF THIS WATCH ---\n" + previous_analysis_text +
+                    "\nIMPORTANT: candle timestamps are authoritative. For H1/M15 timeframes whose "
+                    "last closed candle time is unchanged, preserve the prior structural conclusion "
+                    "unless you name a concrete non-candle input that changed it."
+                )
 
         messages = [
             {"role": "system", "content": DECISION_INSTRUCTIONS},

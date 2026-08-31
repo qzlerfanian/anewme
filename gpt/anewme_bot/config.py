@@ -31,15 +31,15 @@ if not ENV_FILE.exists():
         "سپس مقادیر واقعی (OPENAI_API_KEY, TELEGRAM_BOT_TOKEN, ...) را در آن قرار دهید."
     )
 
-DATA_DIR = BASE_DIR / "data"
-LOG_DIR = BASE_DIR / "logs"
+DATA_DIR = Path(os.getenv('ANEWME_DATA_DIR', str(BASE_DIR / 'data_utc_v2')))
+LOG_DIR = Path(os.getenv('ANEWME_LOG_DIR', str(BASE_DIR / 'logs')))
 RULES_FILE = BASE_DIR / "rules" / "anewme_rules.txt"
 DB_PATH = DATA_DIR / "anewme.db"
 CHART_TMP_DIR = DATA_DIR / "charts_tmp"
 
-DATA_DIR.mkdir(exist_ok=True)
-LOG_DIR.mkdir(exist_ok=True)
-CHART_TMP_DIR.mkdir(exist_ok=True)
+DATA_DIR.mkdir(exist_ok=True, parents=True)
+LOG_DIR.mkdir(exist_ok=True, parents=True)
+CHART_TMP_DIR.mkdir(exist_ok=True, parents=True)
 
 
 @dataclass

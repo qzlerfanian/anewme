@@ -36,14 +36,14 @@ def calculate_position_size(
     اگر min_lot بروکر باعث عبور از سقف ریسک شود، طبق بند ۱۸ به‌جای پیشنهاد
     اشتباه، هشدار داده می‌شود و suggested_volume برابر None برمی‌گردد.
     """
-    if snapshot.account_balance is None:
+    if snapshot.account_balance is None or not math.isfinite(snapshot.account_balance) or snapshot.account_balance <= 0:
         return VolumeCalculationResult(
             suggested_volume=None,
             risk_amount=0.0,
             warning="اطلاعات حساب (Balance) در دسترس نیست؛ حجم قابل محاسبه نیست.",
         )
 
-    if not all([snapshot.symbol_min_lot, snapshot.symbol_lot_step]):
+    if not all(v is not None and math.isfinite(v) and v > 0 for v in (snapshot.symbol_min_lot, snapshot.symbol_lot_step)):
         return VolumeCalculationResult(
             suggested_volume=None,
             risk_amount=0.0,

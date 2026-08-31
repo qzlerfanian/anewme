@@ -17,6 +17,7 @@ telegram_bot/handlers.py
 from __future__ import annotations
 
 import json
+from core.clock import tehran_time
 import logging
 import asyncio
 import re
@@ -27,12 +28,14 @@ from telegram.ext import ContextTypes
 
 from config import config
 from core.analysis_service import AnalysisService
-from storage import db
+from storage import db, work_queue
+from telegram.error import BadRequest, NetworkError
+from contextlib import ExitStack
 from telegram_bot.notifier import format_analysis_message, format_error_message
 
 logger = logging.getLogger(__name__)
 
-TELEGRAM_MESSAGE_LIMIT = 4000  # کمی کمتر از سقف واقعی ۴۰۹۶ برای احتیاط
+TELEGRAM_MESSAGE_LIMIT = 1800  # کمی کمتر از سقف واقعی ۴۰۹۶ برای احتیاط
 ANALYSIS_SYMBOLS = ("EURUSD", "GBPUSD", "XAUUSD", "USDJPY")
 
 
@@ -73,7 +76,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "/analyze SYMBOL - شروع تحلیل جدید (مثال: /analyze EURUSD)\n"
         "/status - نمایش Watchهای فعال\n"
         "/history [SYMBOL] - نمایش سوابق تحلیل\n"
-        "/performance [SYMBOL] - آمار واقعی برد/باخت TRADEها\n"
+        "/performance [SYMBOL] - آمار تخمینی پیشنهادها\n"
         "/inspect [SYMBOL] - دیدن کامل ورودی/خروجی آخرین تحلیل (تصاویر، داده، پاسخ AI)\n\n"
         "⚠️ یادآوری: این ربات فقط تحلیل می‌کند. ثبت/مدیریت معامله همیشه دستی است.",
         reply_markup=_analysis_keyboard(),
@@ -110,7 +113,18 @@ async def analyze_symbol_callback(update: Update, context: ContextTypes.DEFAULT_
     if not _is_authorized(update):
         await query.answer("شما مجاز نیستید.", show_alert=True)
         return
-    await query.answer()
+    try:
+        await query.answer()
+    except BadRequest as exc:
+        if not any(t in str(exc).lower() for t in ("query is too old", "query id is invalid", "response timeout")):
+            raise
+        db.log_event("CALLBACK_EXPIRED", "کلیک منقضی شد؛ تحلیل اجرا نشد.")
+        work_queue.queue_message(f"expired:{update.update_id}", update.effective_chat.id,
+                                "این کلیک منقضی شده است؛ لطفاً دوباره دکمه تحلیل را بزنید.")
+        return
+    except NetworkError:
+        db.log_event("CALLBACK_NETWORK_ERROR", "پاسخ کلیک به تلگرام نرسید؛ تحلیل اجرا نشد.")
+        return
     symbol = query.data.split(":", 1)[1].upper()
     if symbol not in ANALYSIS_SYMBOLS:
         await query.message.reply_text("نماد انتخاب‌شده معتبر نیست.")
@@ -124,19 +138,12 @@ async def _run_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE, symb
         await message.reply_text("نام نماد نامعتبر است؛ فقط حروف، عدد و . _ # - مجازند.")
         return
 
-    # بند ۲: تأیید فوری دریافت فرمان و شروع تحلیل
-    await message.reply_text(f"🔍 دریافت شد. شروع تحلیل {symbol}...")
-    db.log_event("ANALYZE_REQUESTED", f"درخواست تحلیل {symbol} از کاربر", symbol=symbol)
-
-    analysis_service: AnalysisService = context.bot_data["analysis_service"]
-
-    try:
-        result = await asyncio.to_thread(analysis_service.run_initial_analysis, symbol)
-        await message.reply_text(format_analysis_message(result))
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("تحلیل %s ناموفق بود", symbol)
-        db.log_error("analyze_command", str(exc), symbol=symbol)
-        await message.reply_text(format_error_message("تحلیل", str(exc), symbol))
+    job_id = f"manual:{update.update_id}"
+    queued = work_queue.enqueue(job_id, symbol, update.effective_chat.id)
+    text = (f"🔍 درخواست تحلیل {symbol} ثبت شد؛ نتیجه جداگانه ارسال می‌شود."
+            if queued else f"برای {symbol} یک تحلیل در صف یا در حال اجراست؛ درخواست تکراری اجرا نشد.")
+    work_queue.queue_message("ack:" + job_id, update.effective_chat.id, text)
+    db.log_event("ANALYZE_REQUESTED" if queued else "ANALYZE_DUPLICATE_SUPPRESSED", text, symbol=symbol)
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -159,11 +166,11 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             f"شرط تریگر: {w['trigger_type']}",
             f"سطح/محدوده: {w['zone_or_level']}",
             f"شرط ابطال: {w['invalidation_condition']}",
-            f"زمان انقضا: {w['expiration']}",
+            f"زمان انقضا: {tehran_time(w['expiration'])}",
             f"وضعیت فعلی: {state}",
             "",
         ]
-    await update.message.reply_text("\n".join(lines))
+    await _send_long_text(update, "", "\n".join(lines))
 
 
 async def performance_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -185,7 +192,7 @@ async def performance_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     avg_r = f"{stats['avg_r_multiple']:.2f}R" if stats["avg_r_multiple"] is not None else "—"
 
     lines = [
-        f"📊 آمار عملکرد واقعی{scope}\n",
+        f"📊 آمار تخمینی پیشنهادها{scope}\n",
         f"مجموع TRADEهای ثبت‌شده: {stats['total']}",
         f"✅ برد (رسیده به TP): {stats['wins']}",
         f"❌ باخت (خورده به SL): {stats['losses']}",
@@ -194,7 +201,7 @@ async def performance_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"🔄 هنوز باز/در انتظار: {stats['pending']}",
         "",
         f"نرخ برد (فقط از بین بسته‌شده‌ها): {win_rate}",
-        f"میانگین R واقعی: {avg_r}",
+        f"میانگین R تخمینی: {avg_r}",
         "",
         "⚠️ این آمار بر اساس تعقیب قیمت توسط خودِ ربات است، نه حساب واقعی "
         "شما - اگر معامله را زودتر بسته یا حجم را تغییر داده باشید، این "
@@ -227,8 +234,12 @@ async def inspect_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         chart_paths = [Path(p) for p in json.loads(row["chart_paths"] or "[]")]
         existing = [p for p in chart_paths if p.exists()]
         if existing:
-            media = [InputMediaPhoto(open(p, "rb"), caption=p.stem) for p in existing[:10]]
-            await update.message.reply_media_group(media)
+            with ExitStack() as stack:
+                media = [InputMediaPhoto(stack.enter_context(open(p, "rb")), caption=p.stem) for p in existing[:10]]
+                if len(media) == 1:
+                    await update.message.reply_photo(media[0].media)
+                else:
+                    await update.message.reply_media_group(media)
         else:
             await update.message.reply_text("(تصاویر این تحلیل دیگر روی دیسک موجود نیستند.)")
     except Exception as exc:  # noqa: BLE001

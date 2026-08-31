@@ -20,11 +20,30 @@ from __future__ import annotations
 import logging
 import json
 import uuid
+import threading
+from functools import wraps
+from storage import work_queue
+from watch.conditions import parse_conditions
+
+_service_locks = {}
+_service_lock_guard = threading.Lock()
+
+def symbol_locked(method):
+    @wraps(method)
+    def invoke(self, item, *args, **kwargs):
+        symbol = item if isinstance(item, str) else item['symbol']
+        with _service_lock_guard:
+            lock = _service_locks.setdefault(symbol, threading.RLock())
+        with lock:
+            return method(self, item, *args, **kwargs)
+    return invoke
+from core.clock import utc_now
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 from broker.base import BrokerBase
+from broker.candle_utils import closed_only, latest_closed, normalize_candle, utc
 from config import config
 from core.models import AnalysisResult, AnalysisStatus, Direction, Grade, MarketSnapshot, WatchDetails, WatchState
 from core.parser import AIResponseParseError, parse_ai_response
@@ -46,6 +65,7 @@ class AnalysisService:
         self.ai_client = ai_client
 
     # ------------------------------------------------------------------
+    @symbol_locked
     def run_initial_analysis(self, symbol: str, needs_correlated_symbols: bool = True) -> AnalysisResult:
         """تحلیل اولیه از طریق دستور /analyze (بند ۲)."""
         # این بررسی باید قبل از snapshot/چارت/AI انجام شود.
@@ -67,37 +87,13 @@ class AnalysisService:
             if active_watch_invalidated:
                 reason += " واچ فعال قبلی با وضعیت «باطل‌شده» بسته شد."
             result = AnalysisResult(
-                analysis_time=datetime.now(timezone.utc), symbol=symbol,
+                analysis_time=utc_now(), symbol=symbol,
                 status=AnalysisStatus.NO_TRADE, direction=None, grade=None,
                 reason=reason,
                 timeframes_checked=[], account_state=account_state,
                 account_state_details=account_details,
             )
             db.log_event(f"ACCOUNT_STATE_{account_state}", result.reason, symbol=symbol)
-            return result
-
-        snapshot = self.broker.get_market_snapshot(symbol)
-
-        if not snapshot.market_open:
-            # قبل از هر هزینه‌ای (ساخت چارت، تماس AI)، اگر بازار بسته است
-            # مستقیم و بدون حدس زدن اعلام می‌شود - نیازی به تحلیل نیست.
-            logger.info("بازار %s بسته است - تحلیل بدون فراخوانی AI رد شد.", symbol)
-            result = AnalysisResult(
-                analysis_time=datetime.now(timezone.utc),
-                symbol=symbol,
-                status=AnalysisStatus.NO_TRADE,
-                direction=None,
-                grade=None,
-                reason="بازار برای این نماد در حال حاضر بسته است.",
-                timeframes_checked=[],
-            )
-            db.save_analysis(
-                analysis_id=str(uuid.uuid4()), symbol=symbol, status=result.status.value,
-                direction=None, grade=None, reason=result.reason, raw_ai_text="",
-                chart_paths=[], market_snapshot_dict=_snapshot_to_dict(snapshot),
-                trade_details_dict=None, watch_details_dict=None, parent_watch_id=None,
-            )
-            db.log_event("MARKET_CLOSED", result.reason, symbol=symbol)
             return result
 
         # --- مورد ۲: جلوگیری از ساخت Watch تکراری روی همین نماد ---
@@ -108,7 +104,7 @@ class AnalysisService:
         if existing_watch is not None:
             logger.info("Watch فعال از قبل روی %s وجود دارد - تحلیل جدید رد شد.", symbol)
             result = AnalysisResult(
-                analysis_time=datetime.now(timezone.utc),
+                analysis_time=utc_now(),
                 symbol=symbol,
                 status=AnalysisStatus.WATCH,
                 direction=Direction(existing_watch["direction"]),
@@ -129,6 +125,31 @@ class AnalysisService:
             db.log_event("DUPLICATE_WATCH_PREVENTED", result.reason, symbol=symbol, watch_id=existing_watch["watch_id"])
             return result
 
+        snapshot = self._normalize_snapshot(self.broker.get_market_snapshot(symbol))
+        self._audit_snapshot(snapshot, "INITIAL_SNAPSHOT")
+
+        if not snapshot.market_open:
+            # قبل از هر هزینه‌ای (ساخت چارت، تماس AI)، اگر بازار بسته است
+            # مستقیم و بدون حدس زدن اعلام می‌شود - نیازی به تحلیل نیست.
+            logger.info("بازار %s بسته است - تحلیل بدون فراخوانی AI رد شد.", symbol)
+            result = AnalysisResult(
+                analysis_time=utc_now(),
+                symbol=symbol,
+                status=AnalysisStatus.NO_TRADE,
+                direction=None,
+                grade=None,
+                reason="بازار برای این نماد در حال حاضر بسته است.",
+                timeframes_checked=[],
+            )
+            db.save_analysis(
+                analysis_id=str(uuid.uuid4()), symbol=symbol, status=result.status.value,
+                direction=None, grade=None, reason=result.reason, raw_ai_text="",
+                chart_paths=[], market_snapshot_dict=_snapshot_to_dict(snapshot),
+                trade_details_dict=None, watch_details_dict=None, parent_watch_id=None,
+            )
+            db.log_event("MARKET_CLOSED", result.reason, symbol=symbol)
+            return result
+
         chart_paths = self._build_charts(symbol, snapshot, needs_correlated_symbols)
         raw_text = self.ai_client.request_analysis(symbol, chart_paths, snapshot, previous_watch=None)
         return self._finalize(
@@ -136,6 +157,7 @@ class AnalysisService:
             chart_descriptions_text=self.ai_client.last_chart_descriptions,
         )
 
+    @symbol_locked
     def run_watch_recheck(self, watch_row) -> AnalysisResult:
         """
         تحلیل مجدد بعد از فعال‌شدن Trigger یک Watch (بند ۱۴).
@@ -152,41 +174,35 @@ class AnalysisService:
                 "پوزیشن یا سفارش واقعی روی نماد فعال است؛ سیگنال جدید صادر نشد."
             )
             return AnalysisResult(
-                analysis_time=datetime.now(timezone.utc), symbol=symbol,
+                analysis_time=utc_now(), symbol=symbol,
                 status=AnalysisStatus.NO_TRADE, direction=None, grade=None,
                 reason=reason,
                 timeframes_checked=[], account_state=account_state,
                 account_state_details=account_details,
             )
 
-        snapshot = self.broker.get_market_snapshot(symbol)
+        snapshot = self._normalize_snapshot(self.broker.get_market_snapshot(symbol))
+        snapshot = self._reuse_unchanged_parent_timeframes(snapshot, watch_state)
+        self._audit_snapshot(snapshot, "REANALYSIS_SNAPSHOT", watch_state.watch_id)
 
         if not snapshot.market_open:
-            # بازار بسته است - تحلیل مجدد به‌جای مصرف بی‌فایده AI، به تعویق
-            # می‌افتد. Watch بسته یا جایگزین نمی‌شود، فقط برای بررسی بعدی
-            # (وقتی بازار باز شد و کندل جدید بسته شد) آزاد می‌شود.
-            logger.info("بازار %s بسته است - تحلیل مجدد Watch به تعویق افتاد.", symbol)
-            db.log_event(
-                "WATCH_RECHECK_DEFERRED_MARKET_CLOSED",
-                "بازار بسته است - بررسی به بازگشایی بازار موکول شد.",
-                symbol=symbol, watch_id=watch_state.watch_id,
-            )
-            return AnalysisResult(
-                analysis_time=datetime.now(timezone.utc),
-                symbol=symbol,
-                status=AnalysisStatus.WATCH,
-                direction=watch_state.direction,
-                grade=watch_state.grade,
-                reason="بازار بسته است - بررسی به بازگشایی بازار موکول شد.",
-                timeframes_checked=[],
-                suppress_notification=True,  # کاربر پیام غیرضروری دریافت نمی‌کند
-            )
+            return AnalysisResult(utc_now(), symbol, AnalysisStatus.NO_TRADE,
+                                  watch_state.direction, watch_state.grade,
+                                  "پس از تریگر بازار بسته یا تیک نامعتبر است؛ سناریو بدون معامله بسته شد.", [])
+        if utc_now() >= utc(watch_state.expiration):
+            return AnalysisResult(utc_now(), symbol, AnalysisStatus.NO_TRADE,
+                                  watch_state.direction, watch_state.grade,
+                                  "تحلیل نهایی پس از پایان اعتبار رسید؛ ورود دیرهنگام صادر نشد.", [])
 
-        needed_tfs = watch_state.timeframes_to_recheck or ["M5", "M15", "H1"]
-        chart_paths = self._build_charts(symbol, snapshot, needs_correlated_symbols=True,
-                                          only_timeframes=needed_tfs)
+        # تحلیل نهایی دقیقاً همان ورودی‌های تحلیل اولیه (H1/M15/M5) را
+        # دریافت می‌کند؛ محدودکردن چارت‌ها به M5 باعث «نامشخص» شدن کاذب H1/M15 می‌شد.
+        chart_paths = self._build_charts(symbol, snapshot, needs_correlated_symbols=True)
 
-        raw_text = self.ai_client.request_analysis(symbol, chart_paths, snapshot, previous_watch=watch_state)
+        parent_row = db.get_analysis(watch_state.parent_analysis_id) if watch_state.parent_analysis_id else None
+        raw_text = self.ai_client.request_analysis(
+            symbol, chart_paths, snapshot, previous_watch=watch_state,
+            previous_analysis_text=(parent_row["raw_ai_text"] if parent_row else ""),
+        )
         return self._finalize(
             symbol, raw_text, snapshot, chart_paths, parent_watch=watch_state,
             chart_descriptions_text=self.ai_client.last_chart_descriptions,
@@ -238,12 +254,15 @@ class AnalysisService:
         ایمن تبدیل می‌شود و دلیل دقیق ثبت/اعلام می‌شود.
         """
         analysis_id = str(uuid.uuid4())
+        tracking = None
         parent_watch_id = parent_watch.watch_id if parent_watch else None
 
         # مورد ۴: ساعت آخرین کندل M5 بسته‌شده - برای شفافیت خروجی
         last_closed_m5_time = None
         if snapshot.candles_m5:
-            last_closed_m5_time = snapshot.candles_m5[-1]["time"].strftime("%H:%M UTC")
+            candle = latest_closed(snapshot.candles_m5, "M5", utc_now())
+            if candle:
+                last_closed_m5_time = candle["close_time"].strftime("%Y-%m-%d %H:%M UTC")
 
         try:
             result = parse_ai_response(raw_text, expected_symbol=symbol)
@@ -251,7 +270,7 @@ class AnalysisService:
             logger.error("پارس پاسخ AI شکست خورد: %s", exc)
             db.log_error("ai_response_parse", str(exc), symbol=symbol)
             result = AnalysisResult(
-                analysis_time=datetime.now(timezone.utc),
+                analysis_time=utc_now(),
                 symbol=symbol,
                 status=AnalysisStatus.NO_TRADE,
                 direction=None,
@@ -272,6 +291,9 @@ class AnalysisService:
         if account_state is not None:
             result.account_state = account_state
             result.account_state_details = account_details
+            result.status = AnalysisStatus.NO_TRADE
+            result.trade_details = result.watch_details = None
+            result.reason = 'به‌علت وجود معامله/سفارش یا نامعلوم‌بودن وضعیت حساب، سیگنال جدید صادر نشد.'
             logger.info(
                 "پوزیشن/سفارش باز روی %s پیدا شد (%s) - سیگنال جدید صادر نمی‌شود.",
                 symbol, account_state,
@@ -298,8 +320,56 @@ class AnalysisService:
             )
             return result
 
+        if parent_watch is not None and result.status == AnalysisStatus.TRADE and result.direction != parent_watch.direction:
+            result.status = AnalysisStatus.NO_TRADE
+            result.reason = "جهت خروجی تحلیل نهایی با سناریوی تریگرشده متفاوت است؛ معامله رد شد."
+            result.trade_details = None
+
+        if parent_watch is not None and any(term in (result.reason or '').lower() for term in
+                ('تریگر هنوز', 'تریگر تشکیل نشده', 'تریگر M5 هنوز', 'trigger is missing', 'trigger not formed')):
+            result.status = AnalysisStatus.NO_TRADE
+            result.trade_details = result.watch_details = None
+            result.reason = 'پاسخ نهایی ناسازگار بود: تریگر قبلاً ثبت شده است ولی تحلیل دوباره آن را درخواست کرد؛ سناریو بدون معامله بسته شد.'
+
+        if parent_watch is not None:
+            parent_row = db.get_analysis(parent_watch.parent_analysis_id) if parent_watch.parent_analysis_id else None
+            if parent_row:
+                import re
+                prior = json.loads(parent_row["market_snapshot_json"] or "{}")
+                for tf, attr in (("H1", "candles_h1"), ("M15", "candles_m15")):
+                    old_bars = [_deserialize_candle(c, tf) for c in prior.get(attr, [])]
+                    old_last = latest_closed(old_bars, tf, utc_now())
+                    new_last = latest_closed(getattr(snapshot, attr), tf, utc_now())
+                    old_label = re.search(rf"{tf}\s*=\s*([^;؛\n]+)", parent_row["reason"] or "")
+                    new_label = re.search(rf"{tf}\s*=\s*([^;؛\n]+)", result.reason or "")
+                    if old_last and new_last and old_last["close_time"] == new_last["close_time"] and old_label:
+                        # Keep the immutable structural conclusion, including in displayed reasoning.
+                        if new_label and new_label.group(1).strip() != old_label.group(1).strip():
+                            result.status = AnalysisStatus.NO_TRADE
+                            result.trade_details = result.watch_details = None
+                            result.reason = (f"{tf}={old_label.group(1).strip()}; "
+                                             "تحلیل نهایی ناسازگار رد شد: بدون کندل جدید نتیجه ساختاری تغییر کرده بود.")
+
         if result.status == AnalysisStatus.TRADE:
-            outcome = validate_trade_result(result, snapshot)
+            fresh = self._normalize_snapshot(self.broker.get_market_snapshot(symbol))
+            changed = any(
+                [c["close_time"] for c in getattr(snapshot, attr)][-1:] !=
+                [c["close_time"] for c in getattr(fresh, attr)][-1:]
+                for attr in ("candles_m5", "candles_m15", "candles_h1"))
+            outcome = validate_trade_result(result, fresh)
+            if parent_watch:
+                _, invalid = parse_conditions(parent_watch.direction.value, parent_watch.trigger_type,
+                                               parent_watch.zone_or_level, parent_watch.invalidation_condition)
+                bars = getattr(fresh, {"M5": "candles_m5", "M15": "candles_m15", "H1": "candles_h1"}[invalid.timeframe])
+                if utc_now() >= utc(parent_watch.expiration):
+                    outcome.is_valid = False
+                    outcome.reasons.append("اعتبار سناریو در طول تحلیل نهایی تمام شده است.")
+                if not bars or invalid.matches(bars[-1]["close"]):
+                    outcome.is_valid = False
+                    outcome.reasons.append("سناریوی والد در آخرین کندل معتبر نیست یا داده ابطال موجود نیست.")
+            if changed:
+                outcome.is_valid = False
+                outcome.reasons.append("در طول تحلیل کندل جدید بسته شده است؛ نتیجه قدیمی برای ورود ارسال نشد.")
             if not outcome.is_valid:
                 logger.warning("نتیجه TRADE رد شد: %s", outcome.reasons)
                 result = AnalysisResult(
@@ -313,7 +383,7 @@ class AnalysisService:
                     raw_ai_text=result.raw_ai_text,
                 )
             else:
-                vol_result = calculate_position_size(result.trade_details, snapshot)
+                vol_result = calculate_position_size(result.trade_details, fresh)
                 result.trade_details.suggested_volume = vol_result.suggested_volume
                 if vol_result.warning:
                     result = AnalysisResult(
@@ -323,8 +393,9 @@ class AnalysisService:
                         timeframes_checked=result.timeframes_checked, raw_ai_text=result.raw_ai_text,
                     )
                 else:
-                    balance = snapshot.account_balance or 0.0
-                    current_open_risk = db.get_estimated_open_risk_amount(balance)
+                    balance = fresh.account_balance or 0.0
+                    current_open_risk = max(db.get_estimated_open_risk_amount(balance),
+                                            self.broker.get_account_open_risk_amount())
                     proposed_risk = balance * result.trade_details.risk_percent / 100.0
                     max_open_risk = balance / 5000.0 * config.risk.max_daily_open_risk_usd_per_5000
                     if current_open_risk + proposed_risk > max_open_risk:
@@ -339,7 +410,7 @@ class AnalysisService:
                 # ثبت ردیابی برای سنجش عملکرد واقعی بعداً (/performance) -
                 # این تنها راه سنجش عینی «آیا این استراتژی سودآور است؟» است
                 if result.status == AnalysisStatus.TRADE:
-                    db.create_trade_tracking(
+                    tracking = dict(
                         analysis_id=analysis_id,
                         symbol=symbol,
                         direction=result.direction.value,
@@ -361,54 +432,203 @@ class AnalysisService:
                 logger.warning("تناقض احتمالی در WATCH %s: %s", symbol, warning_text)
                 db.log_event("WATCH_CONSISTENCY_WARNING", warning_text, symbol=symbol)
 
-        # parent_watch پیش از ورود به تحلیل مجدد با TRIGGERED بسته شده است.
-        # بنابراین هر خروجی WATCH در این مرحله همیشه رکورد تازه‌ای می‌سازد.
-        new_watch_id = None
-        if result.status == AnalysisStatus.WATCH and result.watch_details is not None:
-            if parent_watch is not None and watch_manager.is_same_triggered_setup(parent_watch, result.watch_details):
-                result.suppress_notification = True
+            # recheck بعد از Trigger، بررسی نهایی همان سناریو است؛ WATCH مجدد
+            # به معنی تأیید نشدن ورود است، نه مجوز ساخت سناریوی مستقل تازه.
+            if parent_watch is not None:
+                rejection = _specific_final_rejection_reason(result)
+                result = AnalysisResult(
+                    analysis_time=result.analysis_time,
+                    symbol=result.symbol,
+                    status=AnalysisStatus.NO_TRADE,
+                    direction=result.direction,
+                    grade=result.grade,
+                    reason=rejection,
+                    timeframes_checked=result.timeframes_checked,
+                    raw_ai_text=result.raw_ai_text,
+                )
                 db.log_event(
-                    "WATCH_RECREATION_SUPPRESSED",
-                    "خروجی reanalysis همان Watch تریگرشده قبلی بود؛ Watch جدید ساخته نشد.",
-                    symbol=symbol, watch_id=parent_watch.watch_id,
+                    "WATCH_FINAL_CONFIRMATION_REJECTED",
+                    result.reason, symbol=symbol, watch_id=parent_watch.watch_id,
                 )
             else:
-                new_watch = watch_manager.create_watch_from_details(
-                    symbol, result.watch_details, parent_analysis_id=analysis_id
+                previous_row = db.get_latest_closed_watch_for_symbol(symbol)
+                if previous_row is not None:
+                    previous_watch = self._row_to_watch_state(previous_row)
+                    if not self._new_scenario(previous_watch, result.watch_details, snapshot):
+                        result = AnalysisResult(
+                            analysis_time=result.analysis_time,
+                            symbol=result.symbol,
+                            status=AnalysisStatus.NO_TRADE,
+                            direction=result.direction,
+                            grade=result.grade,
+                            reason=(
+                                "Watch جدید ساخته نشد؛ خروجی تحلیل مستقل از نظر جهت، نوع تریگر، "
+                                "سطح و ابطال تغییر معناداری نسبت به سناریوی قبلی ندارد."
+                            ),
+                            timeframes_checked=result.timeframes_checked,
+                            raw_ai_text=result.raw_ai_text,
+                        )
+                        db.log_event(
+                            "WATCH_REPEAT_SCENARIO_SUPPRESSED",
+                            result.reason, symbol=symbol, watch_id=previous_watch.watch_id,
+                        )
+
+        # Watch فقط در تحلیل اولیه ساخته می‌شود. مسیر بعد از Trigger همان
+        # سناریوی قبلی را نهایی می‌کند و هرگز Watch جایگزین نمی‌سازد.
+        new_watch_id = None
+        watch_to_create = None
+        if result.status == AnalysisStatus.WATCH and result.watch_details is not None:
+            try:
+                trigger, invalid = parse_conditions(result.watch_details.preferred_direction.value,
+                    result.watch_details.trigger_type, result.watch_details.exact_zone_or_level, result.watch_details.invalidation)
+                now = utc_now()
+                # Re-fetch at registration time; do not reuse the pre-AI snapshot.
+                bars = self.broker.get_candles(symbol, invalid.timeframe, 3)
+                baseline = latest_closed(bars, invalid.timeframe, now)
+                invalid_reason = watch_manager.validate_before_creation(result.watch_details, baseline)
+                from broker.candle_utils import TIMEFRAME_MINUTES
+                if baseline and (now - baseline["close_time"]).total_seconds() > TIMEFRAME_MINUTES[invalid.timeframe]*60 + 60:
+                    invalid_reason = "واچ ساخته نشد: داده اعتبارسنجی تازه نیست."
+            except (ValueError, TypeError) as exc:
+                baseline = None
+                invalid_reason = f"واچ ساخته نشد: {exc}"
+            if invalid_reason:
+                result = AnalysisResult(
+                    analysis_time=result.analysis_time, symbol=result.symbol,
+                    status=AnalysisStatus.NO_TRADE, direction=result.direction, grade=result.grade,
+                    reason=invalid_reason, timeframes_checked=result.timeframes_checked,
+                    raw_ai_text=result.raw_ai_text, last_closed_m5_time=last_closed_m5_time,
                 )
+                db.log_event("WATCH_CREATION_REJECTED_INVALIDATED", invalid_reason, symbol=symbol)
+            else:
+                watch_to_create = (symbol, result.watch_details, analysis_id, baseline)
+                db.log_event("WATCH_CREATION_BASELINE", json.dumps({
+                    "timeframe": invalid.timeframe, "open_time": str(baseline['open_time']),
+                    "close_time": str(baseline['close_time']), "close": baseline['close'],
+                    "trigger": str(trigger), "invalidation": str(invalid)}, ensure_ascii=False), symbol=symbol)
+
+        result.last_closed_m5_time = last_closed_m5_time
+        with db.transaction():
+            if watch_to_create:
+                new_watch = watch_manager.create_watch_from_details(*watch_to_create)
                 new_watch_id = new_watch.watch_id
+                result.watch_details.expiration = new_watch.expiration.isoformat()
+            if tracking and result.status == AnalysisStatus.TRADE:
+                db.create_trade_tracking(**tracking)
+            db.save_analysis(
+                analysis_id=analysis_id,
+                symbol=symbol,
+                status=result.status.value,
+                direction=result.direction.value if result.direction else None,
+                grade=result.grade.value if result.grade else None,
+                reason=result.reason,
+                raw_ai_text=result.raw_ai_text,
+                chart_descriptions_text=chart_descriptions_text,
+                chart_paths=[str(p) for p in chart_paths],
+                market_snapshot_dict=_snapshot_to_dict(snapshot),
+                trade_details_dict=_dataclass_or_none(result.trade_details),
+                watch_details_dict=_dataclass_or_none(result.watch_details),
+                parent_watch_id=parent_watch_id,
+            )
 
-        db.save_analysis(
-            analysis_id=analysis_id,
-            symbol=symbol,
-            status=result.status.value,
-            direction=result.direction.value if result.direction else None,
-            grade=result.grade.value if result.grade else None,
-            reason=result.reason,
-            raw_ai_text=result.raw_ai_text,
-            chart_descriptions_text=chart_descriptions_text,
-            chart_paths=[str(p) for p in chart_paths],
-            market_snapshot_dict=_snapshot_to_dict(snapshot),
-            trade_details_dict=_dataclass_or_none(result.trade_details),
-            watch_details_dict=_dataclass_or_none(result.watch_details),
-            parent_watch_id=parent_watch_id,
-        )
+            db.log_event(
+                f"ANALYSIS_{result.status.value}",
+                result.reason,
+                symbol=symbol,
+                watch_id=new_watch_id or parent_watch_id,
+            )
 
-        db.log_event(
-            f"ANALYSIS_{result.status.value}",
-            result.reason,
-            symbol=symbol,
-            watch_id=new_watch_id or parent_watch_id,
-        )
+            job = getattr(db._local, "job", None)
+            if job:
+                from telegram_bot.notifier import format_analysis_message
+                recipients = [job["chat_id"]] if job["chat_id"] is not None else config.telegram_allowed_user_ids
+                work_queue.finish(job, format_analysis_message(result), recipients, result.status.value)
         return result
+
+    @staticmethod
+    def _scenario_reset(previous, snapshot):
+        """Require a post-close invalidation/reset candle, not mere passage of time."""
+        try:
+            trigger, invalid = parse_conditions(previous.direction.value, previous.trigger_type,
+                                                previous.zone_or_level, previous.invalidation_condition)
+            bars = getattr(snapshot, {"M5": "candles_m5", "M15": "candles_m15", "H1": "candles_h1"}[invalid.timeframe])
+            after = utc(previous.closed_at or previous.created_at)
+            return any(c["close_time"] > after and invalid.matches(c["close"]) for c in bars[:-1])
+        except (ValueError, KeyError):
+            return False
+
+    def _new_scenario(self, previous, details, snapshot):
+        if previous.direction != details.preferred_direction or self._scenario_reset(previous, snapshot):
+            return True
+        if watch_manager.is_materially_same_scenario(previous, details):
+            return False
+        parent = db.get_analysis(previous.parent_analysis_id) if previous.parent_analysis_id else None
+        if not parent:
+            return False
+        old = json.loads(parent['market_snapshot_json'] or '{}')
+        # A changed level alone is insufficient: require a new higher-timeframe
+        # closed candle to break the prior observed range, or a reset above.
+        for tf, attr in (('M15', 'candles_m15'), ('H1', 'candles_h1')):
+            earlier = [_deserialize_candle(c, tf) for c in old.get(attr, [])]
+            current = getattr(snapshot, attr)
+            if earlier and current and current[-1]['close_time'] > earlier[-1]['close_time']:
+                if current[-1]['close'] > max(c['high'] for c in earlier) or current[-1]['close'] < min(c['low'] for c in earlier):
+                    return True
+        return False
+
+    def _reuse_unchanged_parent_timeframes(self, fresh: MarketSnapshot, watch: WatchState) -> MarketSnapshot:
+        """Keep the exact parent candle series when a timeframe has no new close."""
+        if not watch.parent_analysis_id:
+            return fresh
+        row = db.get_analysis(watch.parent_analysis_id)
+        if row is None or not row["market_snapshot_json"]:
+            return fresh
+        try:
+            old = json.loads(row["market_snapshot_json"])
+            for tf, attr in (("M5", "candles_m5"), ("M15", "candles_m15"), ("H1", "candles_h1")):
+                old_items = [_deserialize_candle(c, tf) for c in old.get(attr, [])]
+                new_items = getattr(fresh, attr)
+                old_last = latest_closed(old_items, tf, utc_now())
+                new_last = latest_closed(new_items, tf, utc_now())
+                if old_last and new_last and old_last["close_time"] == new_last["close_time"]:
+                    setattr(fresh, attr, old_items)
+                    db.log_event(
+                        "REANALYSIS_TIMEFRAME_REUSED",
+                        f"{tf}: کندل جدید بسته نشده؛ داده والد تا {old_last['close_time'].isoformat()} عیناً بازاستفاده شد.",
+                        symbol=fresh.symbol, watch_id=watch.watch_id,
+                    )
+        except Exception as exc:  # داده قدیمی خراب نباید کل reanalysis را متوقف کند.
+            db.log_error("reuse_parent_snapshot", str(exc), symbol=fresh.symbol)
+        return fresh
+
+    @staticmethod
+    def _normalize_snapshot(snapshot: MarketSnapshot) -> MarketSnapshot:
+        """Apply the single closed-candle definition to every broker source."""
+        reference = min(utc(snapshot.market_time_utc), utc_now())
+        snapshot.market_time_utc = utc(snapshot.market_time_utc)
+        snapshot.broker_server_time = utc(snapshot.broker_server_time)
+        for tf, attr in (("M5", "candles_m5"), ("M15", "candles_m15"), ("H1", "candles_h1")):
+            setattr(snapshot, attr, closed_only(getattr(snapshot, attr), tf, reference))
+        return snapshot
+
+    @staticmethod
+    def _audit_snapshot(snapshot: MarketSnapshot, event: str, watch_id: str | None = None) -> None:
+        now = utc_now()
+        for tf, candles in (("M5", snapshot.candles_m5), ("M15", snapshot.candles_m15), ("H1", snapshot.candles_h1)):
+            candle = latest_closed(candles, tf, now)
+            if candle:
+                db.log_event(
+                    event,
+                    f"{tf}: open_time_utc={candle['open_time'].isoformat()}; close_time_utc={candle['close_time'].isoformat()}; C={candle['close']}",
+                    symbol=snapshot.symbol, watch_id=watch_id,
+                )
 
     def _get_account_status(self, symbol: str) -> tuple[str | None, list[dict]]:
         """
         بند جدید (مورد ۳): تشخیص پوزیشن باز یا سفارش Pending واقعی روی این
         نماد، مستقیم از حساب MT5 - تا معاملات دستی موبایل/دسکتاپ هم دیده
-        شوند. اگر خطایی در ارتباط با بروکر رخ دهد، محافظه‌کارانه None
-        برگردانده می‌شود (یعنی تحلیل عادی ادامه پیدا می‌کند) تا یک خطای
-        موقت شبکه کل تحلیل را متوقف نکند.
+        شوند. خطای ارتباط، ACCOUNT_STATE_UNKNOWN برمی‌گرداند و صدور
+        سیگنال را متوقف می‌کند؛ خطا معادل حساب خالی نیست.
         """
         try:
             positions = self.broker.get_open_positions(symbol)
@@ -448,6 +668,8 @@ class AnalysisService:
             is_closed=bool(row["is_closed"]),
             close_status=row["close_status"] if "close_status" in row.keys() else None,
             closed_at=(datetime.fromisoformat(row["closed_at"]) if "closed_at" in row.keys() and row["closed_at"] else None),
+            triggered_at=(datetime.fromisoformat(row["triggered_at"]) if "triggered_at" in row.keys() and row["triggered_at"] else None),
+            close_reason=row["close_reason"] if "close_reason" in row.keys() else None,
         )
 
 
@@ -466,3 +688,27 @@ def _dataclass_or_none(obj):
 def _snapshot_to_dict(snapshot: MarketSnapshot) -> dict:
     from dataclasses import asdict
     return asdict(snapshot)
+
+
+def _deserialize_candle(value: dict, timeframe: str) -> dict:
+    item = dict(value)
+    for key in ("time", "open_time", "close_time"):
+        if isinstance(item.get(key), str):
+            item[key] = utc(datetime.fromisoformat(item[key].replace("Z", "+00:00")))
+    return normalize_candle(item, timeframe, source_index=item.get("source_index"))
+
+
+def _specific_final_rejection_reason(result: AnalysisResult) -> str:
+    """Never hide the concrete post-trigger rejection behind a generic sentence."""
+    detail = (result.reason or "").strip()
+    grade = result.grade.value if result.grade else "نامشخص"
+    generic = any(text in detail.lower() for text in (
+        "شرایط ورود نهایی محقق نشده", "شرایط نهایی ورود", "final entry conditions",
+    )) or len(detail) < 12
+    if generic:
+        return (
+            f"پس از تریگر، معامله رد شد: مدل دلیل قابل‌اندازه‌گیری برای تأیید ورود ارائه نکرد (گرید {grade}). "
+            "علت فنی رد، ناکافی‌بودن پاسخ تحلیل است؛ عامل بازار حدس زده نمی‌شود. "
+            f"متن بررسی: {detail or 'دلیل جزئی از تحلیل‌گر دریافت نشد.'}"
+        )
+    return f"پس از تریگر، معامله رد شد و سناریو بسته شد. عامل دقیق رد: {detail} (گرید نهایی: {grade})."

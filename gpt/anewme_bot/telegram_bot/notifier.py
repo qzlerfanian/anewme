@@ -9,6 +9,7 @@ telegram_bot/notifier.py
 from __future__ import annotations
 
 from core.models import AnalysisResult, AnalysisStatus, Grade
+from core.clock import tehran_time
 
 STATUS_EMOJI = {
     AnalysisStatus.TRADE: "✅",
@@ -40,9 +41,9 @@ def format_analysis_message(result: AnalysisResult) -> str:
         label = ACCOUNT_STATE_LABEL.get(result.account_state, result.account_state)
         header = f"{emoji} {result.symbol} | {label}"
         lines = [header, ""]
-        lines.append(f"🕒 Analysis Time: {result.analysis_time.strftime('%Y-%m-%d %H:%M UTC')}")
+        lines.append(f"🕒 Analysis Time: {tehran_time(result.analysis_time)}")
         if result.last_closed_m5_time:
-            lines.append(f"🕔 Last Closed M5: {result.last_closed_m5_time}")
+            lines.append(f"🕔 Last Closed M5: {tehran_time(result.last_closed_m5_time)}")
         if result.grade:
             lines.append(f"وضعیت تحلیلی فعلی بازار (فقط اطلاعاتی): Grade {result.grade.value}")
         lines.append(f"📝 {result.reason}")
@@ -85,9 +86,9 @@ def format_analysis_message(result: AnalysisResult) -> str:
         header += f" | {result.grade.value}"
 
     lines = [header, ""]
-    lines.append(f"🕒 Analysis Time: {result.analysis_time.strftime('%Y-%m-%d %H:%M UTC')}")
+    lines.append(f"🕒 Analysis Time: {tehran_time(result.analysis_time)}")
     if result.last_closed_m5_time:
-        lines.append(f"🕔 Last Closed M5: {result.last_closed_m5_time}")
+        lines.append(f"🕔 Last Closed M5: {tehran_time(result.last_closed_m5_time)}")
     if result.direction:
         lines.append(f"↕️ Direction: {result.direction.value}")
     lines.append(f"📝 Reason: {result.reason}")
@@ -106,7 +107,7 @@ def format_analysis_message(result: AnalysisResult) -> str:
             f"Risk: {td.risk_percent}%",
             f"Suggested Volume: {td.suggested_volume if td.suggested_volume is not None else 'محاسبه نشد - به دلیل زیر توجه کنید'}",
             f"Reward/Risk: {td.reward_risk_ratio}",
-            f"Expiration: {td.expiration}",
+            f"Expiration: {tehran_time(td.expiration)}",
             f"Invalidation: {td.invalidation}",
         ]
 
@@ -119,7 +120,7 @@ def format_analysis_message(result: AnalysisResult) -> str:
             f"Trigger Type: {wd.trigger_type}",
             f"Zone/Level: {wd.exact_zone_or_level}",
             f"Recheck Timeframes: {', '.join(wd.timeframes_to_recheck)}",
-            f"Expiration: {wd.expiration}",
+            f"Expiration: {tehran_time(wd.expiration)}",
             f"Invalidation: {wd.invalidation}",
             "وضعیت فعلی: در انتظار تریگر",
         ]

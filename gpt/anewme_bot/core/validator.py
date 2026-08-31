@@ -10,11 +10,13 @@ NO_TRADE می‌شود و دلیل دقیق ثبت می‌شود (نه سکوت�
 from __future__ import annotations
 
 from dataclasses import dataclass
+from core.clock import utc_now
 from datetime import datetime, timezone
 import math
 
 from config import config, GRADES_ALLOWING_TRADE
 from core.models import AnalysisResult, AnalysisStatus, Direction, Grade, MarketSnapshot
+from broker.candle_utils import latest_closed, TIMEFRAME_MINUTES
 
 
 @dataclass
@@ -54,6 +56,16 @@ def validate_trade_result(
     if result.status != AnalysisStatus.TRADE:
         return ValidationOutcome(is_valid=True)  # این ولیدیتور فقط برای TRADE است
 
+    now = utc_now()
+    for tf, bars in (('M5', snapshot.candles_m5), ('M15', snapshot.candles_m15), ('H1', snapshot.candles_h1)):
+        candle = latest_closed(bars, tf, now)
+        if candle is None or (now - candle['close_time']).total_seconds() > TIMEFRAME_MINUTES[tf]*60 + 60:
+            reasons.append(f'داده بسته‌شده {tf} موجود یا تازه نیست.')
+    if not {'M5', 'M15', 'H1'}.issubset(result.timeframes_checked):
+        reasons.append('هر سه تایم‌فریم در نتیجه بررسی نشده‌اند.')
+    if not all(math.isfinite(v) and v > 0 for v in (snapshot.bid, snapshot.ask)) or snapshot.ask < snapshot.bid:
+        reasons.append('قیمت Bid/Ask معتبر نیست.')
+
     td = result.trade_details
     if td is None:
         return ValidationOutcome(
@@ -65,6 +77,8 @@ def validate_trade_result(
     numeric_values = (td.entry, td.stop_loss, td.take_profit, td.risk_percent, td.reward_risk_ratio)
     if not all(math.isfinite(v) for v in numeric_values):
         reasons.append("یکی از مقادیر عددی معامله NaN یا Infinity است.")
+    if any(v <= 0 for v in numeric_values):
+        reasons.append('مقادیر معامله باید مثبت باشند.')
 
     # ۱) نوع سفارش Pending باشد (در parser.py تضمین شده اما دوباره چک می‌شود)
     from core.models import OrderType
@@ -127,9 +141,9 @@ def validate_trade_result(
     if not snapshot.market_open:
         reasons.append("بازار در حال حاضر بسته است.")
     max_data_age = 5 * 60  # ۵ دقیقه - می‌تواند تنظیم‌پذیر شود
-    age = (datetime.now(timezone.utc) - snapshot.market_time_utc.replace(tzinfo=timezone.utc)
+    age = (utc_now() - snapshot.market_time_utc.replace(tzinfo=timezone.utc)
            if snapshot.market_time_utc.tzinfo is None
-           else datetime.now(timezone.utc) - snapshot.market_time_utc).total_seconds()
+           else utc_now() - snapshot.market_time_utc).total_seconds()
     if age > max_data_age:
         reasons.append("داده‌های بازار قدیمی هستند (بیش از ۵ دقیقه).")
     if age < -60:
@@ -144,7 +158,7 @@ def validate_trade_result(
             expiration = datetime.fromisoformat(td.expiration.replace("Z", "+00:00"))
             if expiration.tzinfo is None:
                 expiration = expiration.replace(tzinfo=timezone.utc)
-            if expiration <= datetime.now(timezone.utc):
+            if expiration <= utc_now():
                 reasons.append("زمان انقضای سفارش گذشته است.")
         except ValueError:
             reasons.append("فرمت زمان انقضای سفارش معتبر نیست؛ ISO-8601 همراه timezone لازم است.")

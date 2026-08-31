@@ -33,7 +33,7 @@ class WatchLifecycleTests(unittest.TestCase):
             "zone_or_level": "1.1556", "timeframes_to_recheck": ["M5"],
             "expiration": (datetime.now(timezone.utc) + timedelta(hours=4)).isoformat(),
             "invalidation_condition": "بسته‌شدن کندل M5 زیر 1.1549",
-            "created_at": datetime.now(timezone.utc).isoformat(),
+            "created_at": (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat(),
         }
 
     def test_only_one_active_watch_per_symbol_is_atomic(self):
@@ -80,7 +80,7 @@ class WatchLifecycleTests(unittest.TestCase):
         self.assertEqual(result.account_state_details[0]["ticket"], 10)
         fake_ai.request_analysis.assert_not_called()
 
-    def test_triggered_parent_stays_closed_and_watch_result_creates_new_row(self):
+    def test_triggered_parent_watch_result_closes_scenario_without_new_watch(self):
         db.save_watch(self.watch_dict("old"))
         watch_manager.close_watch("old", "TRIGGERED", "trigger met")
         old_row = db.get_watch("old")
@@ -104,12 +104,10 @@ Timeframes To Recheck: M5
 Expiration: {future}
 Invalidation: بسته‌شدن کندل M5 زیر 1.1550"""
         result = service._finalize("EURUSD", raw, snap, [], parent)
-        self.assertEqual(result.status, AnalysisStatus.WATCH)
+        self.assertEqual(result.status, AnalysisStatus.NO_TRADE)
         self.assertEqual(db.get_watch("old")["close_status"], "TRIGGERED")
         active = db.get_active_watch_for_symbol("EURUSD")
-        self.assertIsNotNone(active)
-        self.assertNotEqual(active["watch_id"], "old")
-        self.assertEqual(active["zone_or_level"], "1.1565")
+        self.assertIsNone(active)
 
     def test_same_triggered_setup_is_not_recreated(self):
         db.save_watch(self.watch_dict("old-same"))
@@ -134,7 +132,7 @@ Timeframes To Recheck: M5
 Expiration: {future}
 Invalidation: بسته‌شدن کندل M5 زیر 1.1548"""
         result = service._finalize("EURUSD", raw, snap, [], parent)
-        self.assertTrue(result.suppress_notification)
+        self.assertEqual(result.status, AnalysisStatus.NO_TRADE)
         self.assertIsNone(db.get_active_watch_for_symbol("EURUSD"))
         self.assertEqual(db.get_watch("old-same")["close_status"], "TRIGGERED")
 
@@ -147,9 +145,47 @@ Invalidation: بسته‌شدن کندل M5 زیر 1.1548"""
         self.assertEqual(row["close_status"], "TRIGGERED")
         self.assertIsNone(db.get_active_watch_for_symbol("EURUSD"))
 
+    def test_trigger_claim_fails_after_expiration(self):
+        expired = self.watch_dict("expired-claim")
+        expired["expiration"] = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+        db.save_watch(expired)
+        self.assertFalse(watch_manager.claim_trigger("expired-claim", "too late"))
+        row = db.get_watch("expired-claim")
+        self.assertEqual(row["is_triggered"], 0)
+        self.assertIsNone(row["triggered_at"])
+
+    def test_independent_analysis_cannot_recreate_previous_scenario_with_small_price_change(self):
+        previous = self.watch_dict("previous", "USDJPY")
+        previous["zone_or_level"] = "159.425"
+        previous["invalidation_condition"] = "بسته‌شدن کندل M5 زیر 159.300"
+        db.save_watch(previous)
+        watch_manager.close_watch("previous", "TRIGGERED", "close above 159.425")
+
+        broker = MockBroker(base_prices={"USDJPY": 159.40})
+        broker.is_market_open = lambda symbol: True
+        service = AnalysisService(broker, MagicMock())
+        snap = broker.get_market_snapshot("USDJPY")
+        future = (datetime.now(timezone.utc) + timedelta(hours=3)).isoformat()
+        raw = f"""Analysis Time: {datetime.now(timezone.utc).isoformat()}
+Symbol: USDJPY
+Status: WATCH
+Direction: --
+Grade: A-
+Reason: همان سناریو با جابه‌جایی جزئی سطح
+Timeframes Checked: H1, M15, M5
+Preferred Direction: BUY
+Trigger Type: بسته شدن M5 Candle بالای سطح
+Zone Or Level: 159.430
+Timeframes To Recheck: M5
+Expiration: {future}
+Invalidation: بسته‌شدن کندل M5 زیر 159.305"""
+        result = service._finalize("USDJPY", raw, snap, [], parent_watch=None)
+        self.assertEqual(result.status, AnalysisStatus.NO_TRADE)
+        self.assertIsNone(db.get_active_watch_for_symbol("USDJPY"))
+
     def test_closed_candle_is_claimed_once_per_watch(self):
         db.save_watch(self.watch_dict("candle-once"))
-        candle_time = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+        candle_time = datetime.now(timezone.utc).replace(second=0, microsecond=0) - timedelta(minutes=10)
 
         class FixedBroker:
             def get_candles(self, symbol, timeframe, count):
@@ -189,7 +225,7 @@ class WatchMonitorFlowTests(unittest.IsolatedAsyncioTestCase):
             "zone_or_level": "1.1556", "timeframes_to_recheck": ["M5"],
             "expiration": (datetime.now(timezone.utc) + timedelta(hours=4)).isoformat(),
             "invalidation_condition": "بسته‌شدن کندل M5 زیر 1.1549",
-            "created_at": datetime.now(timezone.utc).isoformat(),
+            "created_at": (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat(),
         })
 
     async def asyncTearDown(self):
@@ -198,8 +234,10 @@ class WatchMonitorFlowTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_trigger_closes_parent_runs_reanalysis_and_reports(self):
         broker = MagicMock()
+        broker.get_open_positions.return_value = []
+        broker.get_pending_orders.return_value = []
         broker.get_candles.return_value = [{
-            "time": datetime.now(timezone.utc), "open": 1.1550,
+            "time": datetime.now(timezone.utc) - timedelta(minutes=10), "open": 1.1550,
             "high": 1.1562, "low": 1.1550, "close": 1.1560,
         }]
         service = MagicMock()
@@ -214,14 +252,18 @@ class WatchMonitorFlowTests(unittest.IsolatedAsyncioTestCase):
             messages.append(text)
 
         await WatchMonitor(broker, service, notify)._tick()
+        from core.worker import AnalysisWorker
+        await AnalysisWorker(service).tick()
         row = db.get_watch("monitor-watch")
         self.assertEqual(row["close_status"], "TRIGGERED")
         self.assertEqual(row["reanalysis_result"], "NO_TRADE")
         self.assertIsNotNone(row["reanalysis_started_at"])
         self.assertIsNotNone(row["reanalysis_completed_at"])
         service.run_watch_recheck.assert_called_once()
-        self.assertEqual(len(messages), 2)
-        self.assertIn("واچ تریگر شد", messages[0])
+        with db.get_connection() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM analysis_jobs WHERE status='DONE'").fetchone()[0], 1)
+        # Delivery now has its own durable worker; monitoring does not call Telegram.
+        self.assertEqual(messages, [])
 
 
 if __name__ == "__main__":

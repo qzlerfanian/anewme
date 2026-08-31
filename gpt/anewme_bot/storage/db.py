@@ -14,11 +14,15 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from contextlib import contextmanager
-from datetime import datetime
+from core.clock import utc_now
+from datetime import datetime, timezone
 from pathlib import Path
 
-from config import DB_PATH
+from config import DB_PATH, config
+
+_local = threading.local()
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS analyses (
@@ -110,7 +114,11 @@ CREATE TABLE IF NOT EXISTS trade_tracking (
 
 @contextmanager
 def get_connection():
-    conn = sqlite3.connect(DB_PATH)
+    existing = getattr(_local, 'connection', None)
+    if existing is not None:
+        yield existing
+        return
+    conn = sqlite3.connect(DB_PATH, timeout=15)
     conn.row_factory = sqlite3.Row
     try:
         yield conn
@@ -119,9 +127,46 @@ def get_connection():
         conn.close()
 
 
+@contextmanager
+def transaction():
+    if getattr(_local, 'connection', None) is not None:
+        yield
+        return
+    with get_connection() as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        _local.connection = conn
+        try:
+            yield
+        except BaseException:
+            conn.rollback()
+            raise
+        finally:
+            _local.connection = None
+
+
 def init_db() -> None:
+    # Recoverable upgrade: copy an existing legacy DB before touching its schema.
+    if Path(DB_PATH).exists():
+        with sqlite3.connect(DB_PATH) as source:
+            legacy = source.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='analysis_jobs'").fetchone() is None
+            if legacy:
+                backup = Path(DB_PATH).with_suffix('.pre-fix-' + utc_now().strftime('%Y%m%d%H%M%S%f') + '.bak')
+                with sqlite3.connect(backup) as target:
+                    source.backup(target)
     with get_connection() as conn:
         conn.executescript(SCHEMA)
+        conn.executescript('''
+        CREATE TABLE IF NOT EXISTS analysis_jobs (
+          id TEXT PRIMARY KEY, symbol TEXT NOT NULL, watch_id TEXT,
+          chat_id INTEGER, status TEXT NOT NULL DEFAULT 'PENDING',
+          created_at TEXT NOT NULL, started_at TEXT, completed_at TEXT, result_text TEXT);
+        CREATE TABLE IF NOT EXISTS outbox (
+          id TEXT PRIMARY KEY, chat_id INTEGER NOT NULL, text TEXT NOT NULL,
+          watch_id TEXT, status TEXT NOT NULL DEFAULT 'PENDING', attempts INTEGER DEFAULT 0,
+          next_attempt REAL DEFAULT 0, last_error TEXT, sent_at TEXT);
+        CREATE TABLE IF NOT EXISTS chart_cache (
+          fingerprint TEXT PRIMARY KEY, description TEXT NOT NULL, created_at TEXT NOT NULL);
+        ''')
         # migration برای دیتابیس‌های ساخته‌شده قبل از اضافه‌شدن این ستون‌ها
         for stmt in (
             "ALTER TABLE watches ADD COLUMN last_checked_candle_time TEXT",
@@ -135,15 +180,20 @@ def init_db() -> None:
             "ALTER TABLE watches ADD COLUMN reanalysis_result TEXT",
             "ALTER TABLE watches ADD COLUMN notification_suppressed INTEGER DEFAULT 0",
             "ALTER TABLE watches ADD COLUMN notification_note TEXT",
+            "ALTER TABLE watches ADD COLUMN conditions_json TEXT",
+            "ALTER TABLE watches ADD COLUMN candle_cursors TEXT DEFAULT '{}'",
+            "ALTER TABLE watches ADD COLUMN pending_event TEXT",
+            "ALTER TABLE watches ADD COLUMN trigger_candle_time TEXT",
         ):
             try:
                 conn.execute(stmt)
-            except sqlite3.OperationalError:
-                pass  # ستون از قبل وجود دارد
+            except sqlite3.OperationalError as exc:
+                if 'duplicate column' not in str(exc).lower():
+                    raise
 
         # ترمیم رکوردهای نسخه قبلی که is_triggered=1 شده‌اند اما به‌علت
         # باگ/قطع اجرا is_closed یا close_status آن‌ها کامل ذخیره نشده است.
-        now = datetime.utcnow().isoformat()
+        now = utc_now().isoformat()
         conn.execute(
             """UPDATE watches
                SET is_closed = 1, close_status = 'TRIGGERED',
@@ -173,11 +223,22 @@ def init_db() -> None:
                 conn.execute(
                     """UPDATE watches SET is_closed = 1, close_status = 'INVALIDATED',
                        closed_at = ?, close_reason = ? WHERE watch_id = ?""",
-                    (datetime.utcnow().isoformat(), "مهاجرت: Watch فعال تکراری قدیمی بسته شد.", duplicate["watch_id"]),
+                    (utc_now().isoformat(), "مهاجرت: Watch فعال تکراری قدیمی بسته شد.", duplicate["watch_id"]),
                 )
         conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS ux_watches_one_active_symbol "
             "ON watches(symbol) WHERE is_closed = 0"
+        )
+
+        # پاک‌سازی یک‌باره داده‌های مصنوعی که در نسخه بسته‌بندی قبلی بر اثر
+        # اجرای اشتباه تست رگرسیون روی دیتابیس runtime باقی مانده بودند.
+        conn.execute(
+            """UPDATE watches
+               SET is_closed = 1, close_status = 'INVALIDATED', closed_at = ?,
+                   close_reason = 'پاک‌سازی خودکار رکورد مصنوعی تست؛ این نماد در MT5 واقعی وجود ندارد.'
+               WHERE is_closed = 0
+                 AND (symbol LIKE 'REGDUP%' OR symbol LIKE 'REGRESSION_SYMBOL%')""",
+            (utc_now().isoformat(),),
         )
 
 
@@ -205,7 +266,7 @@ def save_analysis(
                 watch_details_json, parent_watch_id)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
-                analysis_id, symbol, datetime.utcnow().isoformat(), status, direction, grade,
+                analysis_id, symbol, utc_now().isoformat(), status, direction, grade,
                 reason, raw_ai_text, chart_descriptions_text,
                 json.dumps(chart_paths, ensure_ascii=False),
                 json.dumps(market_snapshot_dict, ensure_ascii=False, default=str),
@@ -225,6 +286,11 @@ def get_latest_analysis(symbol: str | None = None) -> sqlite3.Row | None:
         else:
             cur = conn.execute("SELECT * FROM analyses ORDER BY created_at DESC LIMIT 1")
         return cur.fetchone()
+
+
+def get_analysis(analysis_id: str) -> sqlite3.Row | None:
+    with get_connection() as conn:
+        return conn.execute("SELECT * FROM analyses WHERE id = ?", (analysis_id,)).fetchone()
 
 
 def get_history(symbol: str | None = None, limit: int = 20) -> list[sqlite3.Row]:
@@ -248,7 +314,8 @@ def save_watch(watch: dict) -> None:
     with get_connection() as conn:
         # قفل نوشتن، check و insert را اتمیک می‌کند؛ دو worker هم‌زمان
         # نمی‌توانند برای یک نماد دو Watch فعال بسازند.
-        conn.execute("BEGIN IMMEDIATE")
+        if not conn.in_transaction:
+            conn.execute("BEGIN IMMEDIATE")
         active = conn.execute(
             "SELECT watch_id FROM watches WHERE symbol = ? AND is_closed = 0 LIMIT 1",
             (watch["symbol"],),
@@ -272,6 +339,11 @@ def save_watch(watch: dict) -> None:
                 int(watch.get("is_closed", False)),
             ),
         )
+        if watch.get("last_checked_candle_time"):
+            conn.execute(
+                "UPDATE watches SET last_checked_candle_time = ? WHERE watch_id = ?",
+                (watch["last_checked_candle_time"], watch["watch_id"]),
+            )
 
 
 def get_active_watches() -> list[sqlite3.Row]:
@@ -300,6 +372,16 @@ def get_watch(watch_id: str) -> sqlite3.Row | None:
         return conn.execute("SELECT * FROM watches WHERE watch_id = ?", (watch_id,)).fetchone()
 
 
+def get_latest_closed_watch_for_symbol(symbol: str) -> sqlite3.Row | None:
+    with get_connection() as conn:
+        return conn.execute(
+            """SELECT * FROM watches
+               WHERE symbol = ? AND is_closed = 1
+               ORDER BY COALESCE(closed_at, created_at) DESC LIMIT 1""",
+            (symbol,),
+        ).fetchone()
+
+
 def claim_watch_candle(watch_id: str, candle_time_iso: str) -> bool:
     """هر کندل بسته را برای یک Watch فعال دقیقاً یک‌بار claim می‌کند."""
     with get_connection() as conn:
@@ -307,7 +389,7 @@ def claim_watch_candle(watch_id: str, candle_time_iso: str) -> bool:
             """UPDATE watches SET last_checked_candle_time = ?
                WHERE watch_id = ? AND is_closed = 0 AND is_triggered = 0
                  AND close_status IS NULL
-                 AND (last_checked_candle_time IS NULL OR last_checked_candle_time <> ?)""",
+                 AND (last_checked_candle_time IS NULL OR julianday(last_checked_candle_time) < julianday(?))""",
             (candle_time_iso, watch_id, candle_time_iso),
         )
         claimed = cursor.rowcount == 1
@@ -317,19 +399,25 @@ def claim_watch_candle(watch_id: str, candle_time_iso: str) -> bool:
     return True
 
 
-def claim_watch_trigger(watch_id: str, reason: str) -> bool:
+def claim_watch_trigger(watch_id: str, reason: str, candle_time: str | None = None) -> bool:
     """ACTIVE -> TRIGGERED را اتمیک انجام می‌دهد؛ فقط یک worker برنده می‌شود."""
-    now = datetime.utcnow().isoformat()
+    from datetime import timezone
+    now = utc_now().isoformat()
     with get_connection() as conn:
         cursor = conn.execute(
             """UPDATE watches
                SET is_closed = 1, is_locked = 0, is_triggered = 1,
-                   close_status = 'TRIGGERED', closed_at = ?, close_reason = ?, triggered_at = ?
+                   close_status = 'TRIGGERED', closed_at = ?, close_reason = ?, triggered_at = ?, trigger_candle_time = ?
                WHERE watch_id = ? AND is_closed = 0 AND is_triggered = 0
-                 AND close_status IS NULL""",
-            (now, reason, now, watch_id),
+                 AND close_status IS NULL
+                 AND julianday(expiration) > julianday(?)""",
+            (now, reason, candle_time or now, candle_time, watch_id, now),
         )
         claimed = cursor.rowcount == 1
+        if claimed:
+            row = conn.execute('SELECT symbol FROM watches WHERE watch_id=?', (watch_id,)).fetchone()
+            conn.execute('INSERT OR IGNORE INTO analysis_jobs(id,symbol,watch_id,created_at) VALUES(?,?,?,?)',
+                         ('watch:' + watch_id, row['symbol'], watch_id, now))
     if claimed:
         log_event("WATCH_TRIGGERED", reason, watch_id=watch_id)
     return claimed
@@ -338,7 +426,7 @@ def claim_watch_trigger(watch_id: str, reason: str) -> bool:
 def close_watch_lifecycle(watch_id: str, status: str, reason: str) -> bool:
     if status not in ("TRIGGERED", "INVALIDATED", "EXPIRED"):
         raise ValueError(f"وضعیت پایان Watch نامعتبر است: {status}")
-    now = datetime.utcnow().isoformat()
+    now = utc_now().isoformat()
     with get_connection() as conn:
         cursor = conn.execute(
             """UPDATE watches
@@ -351,14 +439,14 @@ def close_watch_lifecycle(watch_id: str, status: str, reason: str) -> bool:
 
 
 def mark_reanalysis_started(watch_id: str) -> None:
-    now = datetime.utcnow().isoformat()
+    now = utc_now().isoformat()
     with get_connection() as conn:
         conn.execute("UPDATE watches SET reanalysis_started_at = ? WHERE watch_id = ?", (now, watch_id))
     log_event("WATCH_REANALYSIS_STARTED", "تحلیل مجدد خودکار آغاز شد.", watch_id=watch_id)
 
 
 def mark_reanalysis_completed(watch_id: str, result_status: str) -> None:
-    now = datetime.utcnow().isoformat()
+    now = utc_now().isoformat()
     with get_connection() as conn:
         conn.execute(
             "UPDATE watches SET reanalysis_completed_at = ?, reanalysis_result = ? WHERE watch_id = ?",
@@ -395,19 +483,32 @@ def update_watch_flags(watch_id: str, *, is_locked: bool | None = None,
 
 # -------------------------------------------------------------------- logs
 def log_event(event_type: str, message: str, symbol: str | None = None, watch_id: str | None = None) -> None:
+    from core.runtime import redact
+    message = redact(message)
     with get_connection() as conn:
         conn.execute(
             "INSERT INTO events_log (created_at, event_type, symbol, watch_id, message) VALUES (?, ?, ?, ?, ?)",
-            (datetime.utcnow().isoformat(), event_type, symbol, watch_id, message),
+            (utc_now().isoformat(), event_type, symbol, watch_id, message),
         )
 
 
 def log_error(context: str, message: str, symbol: str | None = None) -> None:
+    from core.runtime import redact
+    message = redact(message)
     with get_connection() as conn:
         conn.execute(
             "INSERT INTO errors_log (created_at, symbol, context, message) VALUES (?, ?, ?, ?)",
-            (datetime.utcnow().isoformat(), symbol, context, message),
+            (utc_now().isoformat(), symbol, context, message),
         )
+
+
+def prune_operational_logs(days=90):
+    """Only operational logs/cache; never delete analyses, watches or trade history."""
+    from datetime import timedelta
+    cutoff = (utc_now() - timedelta(days=max(1, days))).isoformat()
+    with get_connection() as conn:
+        for table in ('events_log', 'errors_log', 'chart_cache'):
+            conn.execute(f'DELETE FROM {table} WHERE created_at < ?', (cutoff,))
 
 
 # ---------------------------------------------------------------- settings
@@ -453,7 +554,7 @@ def create_trade_tracking(
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')""",
             (
                 analysis_id, symbol, direction, order_type, entry, stop_loss, take_profit,
-                risk_percent, reward_risk_ratio, expiration, datetime.utcnow().isoformat(),
+                risk_percent, reward_risk_ratio, expiration, utc_now().isoformat(),
             ),
         )
 

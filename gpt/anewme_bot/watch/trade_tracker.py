@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from core.clock import utc_now
 from datetime import datetime, timezone
 
 from broker.base import BrokerBase
@@ -64,7 +65,7 @@ class TradeTracker:
         symbol = trade["symbol"]
         direction = trade["direction"]
         entry, sl, tp = trade["entry"], trade["stop_loss"], trade["take_profit"]
-        now = datetime.now(timezone.utc)
+        now = utc_now()
 
         try:
             bid, ask = self.broker.get_current_price(symbol)
@@ -79,6 +80,18 @@ class TradeTracker:
         entry_check_price = ask if direction == Direction.BUY.value else bid
         exit_check_price = bid if direction == Direction.BUY.value else ask
         candle = closed_candles[-1] if closed_candles else None
+        # Only a complete bar formed AFTER the relevant lifecycle boundary can
+        # supply historical evidence; otherwise use the live executable side.
+        boundary_text = trade['filled_at'] if trade['status'] == 'FILLED' else trade['created_at']
+        boundary = datetime.fromisoformat(boundary_text) if boundary_text else now
+        if boundary.tzinfo is None:
+            boundary = boundary.replace(tzinfo=timezone.utc)
+        if candle:
+            from broker.candle_utils import normalize_candle
+            candle = normalize_candle(candle, 'M5')
+            if candle['open_time'] < boundary or candle['close_time'] > now:
+                candle = None
+        # Bid OHLC cannot prove an Ask fill/exit; don't invent historical spread.
 
         # --- انقضا (فقط اگر هنوز پر نشده) ---
         if trade["status"] == "PENDING" and trade["expiration"]:
@@ -106,7 +119,7 @@ class TradeTracker:
                    ("STOP" in trade["order_type"] and entry_check_price <= entry):
                     filled = True
             # Poll ممکن است تماس Entry را از دست بدهد؛ بازه کندل بسته نیز بررسی می‌شود.
-            if candle and candle["low"] <= entry <= candle["high"]:
+            if direction == Direction.SELL.value and candle and candle["low"] <= entry <= candle["high"]:
                 filled = True
 
             if filled:
@@ -118,7 +131,7 @@ class TradeTracker:
         if trade["status"] == "FILLED":
             hit_tp = (exit_check_price >= tp) if direction == Direction.BUY.value else (exit_check_price <= tp)
             hit_sl = (exit_check_price <= sl) if direction == Direction.BUY.value else (exit_check_price >= sl)
-            if candle:
+            if candle and direction == Direction.BUY.value:
                 hit_tp = hit_tp or (candle["high"] >= tp if direction == Direction.BUY.value else candle["low"] <= tp)
                 hit_sl = hit_sl or (candle["low"] <= sl if direction == Direction.BUY.value else candle["high"] >= sl)
 

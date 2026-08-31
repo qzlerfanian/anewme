@@ -18,8 +18,10 @@ tests/test_rules_regression.py
 from __future__ import annotations
 
 import sys
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -28,6 +30,7 @@ from core.consistency_checker import check_watch_consistency
 from core.models import AnalysisStatus, Grade
 from core.parser import AIResponseParseError, parse_ai_response
 from core.validator import validate_trade_result
+from storage import db
 
 RESULTS: list[tuple[str, bool, str]] = []
 
@@ -37,6 +40,10 @@ def check(description: str, condition: bool, detail: str = "") -> None:
 
 
 def run_all_tests() -> None:
+    # هیچ تستی حق نوشتن در data/anewme.db اجرای واقعی را ندارد.
+    test_dir = TemporaryDirectory()
+    original_db_path = db.DB_PATH
+    db.DB_PATH = Path(test_dir.name) / "rules-regression.db"
     broker = MockBroker(base_prices={"EURUSD": 1.1750})
     # تست‌های عمومی نباید به روز واقعی هفته (شنبه/یکشنبه) وابسته باشند -
     # فقط سناریوی اختصاصی «بازار بسته» (پایین همین فایل) این را جدا تست می‌کند.
@@ -120,7 +127,7 @@ Order Type: SELL_LIMIT
 Entry: {bid + 0.0015}
 Stop Loss: {bid + 0.0030}
 Take Profit: {bid - 0.0030}
-Risk Percent: 1.0
+Risk Percent: 0.5
 Reward Risk Ratio: 3.0
 Expiration: 2099-08-06T18:00:00Z
 Invalidation: بسته‌شدن بالای Stop Loss
@@ -281,13 +288,14 @@ Invalidation: بسته‌شدن زیر {bid - 0.010}
     from datetime import timedelta
 
     init_db()
-    dup_broker = MockBroker(base_prices={"EURUSD": 1.1750})
+    dup_symbol = f"REGDUP_{uuid.uuid4().hex}"
+    dup_broker = MockBroker(base_prices={dup_symbol: 1.1750})
     dup_broker.is_market_open = lambda symbol: True
     future_exp = (datetime.now(timezone.utc) + timedelta(hours=6)).isoformat()
     fake_ai_dup = MagicMock()
     fake_ai_dup.last_chart_descriptions = "توصیف نمونه"
     fake_ai_dup.request_analysis.return_value = f"""Analysis Time: 2026-08-09T09:00:00Z
-Symbol: EURUSD
+Symbol: {dup_symbol}
 Status: WATCH
 Direction: --
 Grade: A-
@@ -301,9 +309,10 @@ Expiration: {future_exp}
 Invalidation: بسته‌شدن زیر 1.1600
 """
     svc_dup = AnalysisService(broker=dup_broker, ai_client=fake_ai_dup)
+    svc_dup._build_charts = MagicMock(return_value=[])
     try:
-        r1 = svc_dup.run_initial_analysis("EURUSD", needs_correlated_symbols=False)
-        r2 = svc_dup.run_initial_analysis("EURUSD", needs_correlated_symbols=False)
+        r1 = svc_dup.run_initial_analysis(dup_symbol, needs_correlated_symbols=False)
+        r2 = svc_dup.run_initial_analysis(dup_symbol, needs_correlated_symbols=False)
         ok = (
             r1.status == AnalysisStatus.WATCH
             and r2.status == AnalysisStatus.WATCH
@@ -368,6 +377,7 @@ Reason: تست
 Timeframes Checked: M5
 """
     svc_m5 = AnalysisService(broker=m5_broker, ai_client=fake_ai_m5)
+    svc_m5._build_charts = MagicMock(return_value=[])
     try:
         r = svc_m5.run_initial_analysis("USDCHF", needs_correlated_symbols=False)
         ok = r.last_closed_m5_time is not None and "UTC" in r.last_closed_m5_time
@@ -382,13 +392,20 @@ Timeframes Checked: M5
 
     init_db()
     weird_row = {
-        "watch_id": "regression-weird", "symbol": "EURUSD", "direction": "BUY",
+        "watch_id": f"regression-weird-{uuid.uuid4()}", "symbol": f"REGRESSION_SYMBOL_{uuid.uuid4().hex}", "direction": "BUY",
         "trigger_type": "M5 Close > 1.1560", "zone_or_level": "1.1560",
         "expiration": "2099-01-01T00:00:00+00:00",
+        "parent_analysis_id": "regression", "grade": "A-",
+        "timeframes_to_recheck": ["M5"],
+        "invalidation_condition": "M5 Close < 1.1500",
+        "created_at": "2026-08-11T09:00:00+00:00",
         "is_locked": 0, "is_triggered": 0, "is_closed": 0,
         "last_checked_candle_time": None,
     }
+    db.save_watch(weird_row)
     weird_broker = MagicMock()
+    weird_broker.get_open_positions.return_value = []
+    weird_broker.get_pending_orders.return_value = []
     weird_broker.get_candles.return_value = [{
         "time": datetime(2026, 8, 11, 10, 0, tzinfo=timezone.utc),
         "open": 1.1550, "high": 1.1570, "low": 1.1548, "close": 1.1565,
@@ -402,6 +419,9 @@ Timeframes Checked: M5
         )
     except Exception as exc:  # noqa: BLE001
         check("سناریو ۱۴: Trigger Type غیراستاندارد نباید بی‌صدا نادیده گرفته شود", False, f"استثنا: {exc}")
+
+    db.DB_PATH = original_db_path
+    test_dir.cleanup()
 
 
 def main() -> int:

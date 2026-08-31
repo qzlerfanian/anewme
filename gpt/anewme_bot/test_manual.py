@@ -9,9 +9,17 @@ test_manual.py
   3. چارت‌ها تولید می‌شوند
   4. پاسخ AI پارس و اعتبارسنجی می‌شود
 
-بعد از دیدن پاسخ صحیح اینجا، خیالتان راحت باشد main.py هم کار می‌کند.
-این فایل را بعد از تست، از پروژه حذف کنید (جزو معماری اصلی نیست).
+این تست اتصال MT5 یا تلگرام را تأیید نمی‌کند. تماس هزینه‌دار فقط با
+گزینه صریح --live-api انجام می‌شود. بدون آن هیچ درخواست API ارسال نمی‌شود.
 """
+
+import os
+from tempfile import TemporaryDirectory
+
+# Separate data root BEFORE importing config or service. No runtime contamination.
+_test_directory = TemporaryDirectory(prefix='anewme-manual-')
+os.environ['ANEWME_DATA_DIR'] = _test_directory.name
+os.environ['ANEWME_LOG_DIR'] = _test_directory.name
 
 from broker.mock_broker import MockBroker
 from core.analysis_service import AnalysisService
@@ -19,6 +27,12 @@ from storage.db import init_db
 from telegram_bot.notifier import format_analysis_message
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description='Optional paid API smoke test with a mock broker')
+    parser.add_argument('--live-api', action='store_true', help='Allow real, billable OpenAI requests')
+    if not parser.parse_args().live_api:
+        print('No API call made. Offline tests: python -m unittest discover -s tests -q')
+        return
     print("در حال آماده‌سازی دیتابیس...")
     init_db()
 
@@ -37,7 +51,7 @@ def main():
     print("\n========== نتیجه ==========\n")
     print(format_analysis_message(result))
     print("\n============================\n")
-    print("اگر پیام بالا را بدون خطا دیدید، تنظیمات AI و قوانین درست است.")
+    print("این خروجی فقط تست API با داده ساختگی است؛ MT5 و تلگرام تست نشده‌اند.")
 
 
 if __name__ == "__main__":
